@@ -1,0 +1,14 @@
+{
+  "name": "@flowforge/config",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "files": [
+    "tsconfig.base.json",
+    "eslint.config.mjs"
+  ],
+  "scripts": {
+    "lint": "echo 'Config package lint ok'",
+    "typecheck": "echo 'Config package typecheck ok'"
+  }
+}
