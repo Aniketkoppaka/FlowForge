@@ -6,8 +6,13 @@ import { loadConfig } from "./config.js";
 import {
   PrismaUserRepository,
   PrismaSessionRepository,
-  PrismaWorkflowRepository
+  PrismaWorkflowRepository,
+  PrismaExecutionRepository
 } from "./repositories/prisma-repositories.js";
+import {
+  OutboxDispatcher,
+  WorkflowRunProcessor
+} from "./services/execution-orchestrator.js";
 import {
   SESSION_COOKIE_NAME,
   CSRF_COOKIE_NAME,
@@ -65,7 +70,14 @@ describe.skipIf(!shouldRunIntegration)(
     const userRepo = new PrismaUserRepository();
     const sessionRepo = new PrismaSessionRepository();
     const workflowRepo = new PrismaWorkflowRepository();
-    const app = createApp({ config: testConfig, userRepo, sessionRepo, workflowRepo });
+    const executionRepo = new PrismaExecutionRepository();
+    const app = createApp({
+      config: testConfig,
+      userRepo,
+      sessionRepo,
+      workflowRepo,
+      executionRepo
+    });
 
     beforeAll(async () => {
       const dbUrl = process.env.DATABASE_URL ?? "";
@@ -75,13 +87,25 @@ describe.skipIf(!shouldRunIntegration)(
         );
       }
       await prisma.$connect();
-      // Clean test tables in FK order: Workflow -> Session -> User
+      // Clean test tables in FK order
+      await prisma.outboxEvent.deleteMany({});
+      await prisma.executionAttempt.deleteMany({});
+      await prisma.nodeExecution.deleteMany({});
+      await prisma.workflowRun.deleteMany({});
+      await prisma.workflow.updateMany({ data: { publishedVersionId: null } });
+      await prisma.workflowVersion.deleteMany({});
       await prisma.workflow.deleteMany({});
       await prisma.session.deleteMany({});
       await prisma.user.deleteMany({});
     });
 
     afterAll(async () => {
+      await prisma.outboxEvent.deleteMany({});
+      await prisma.executionAttempt.deleteMany({});
+      await prisma.nodeExecution.deleteMany({});
+      await prisma.workflowRun.deleteMany({});
+      await prisma.workflow.updateMany({ data: { publishedVersionId: null } });
+      await prisma.workflowVersion.deleteMany({});
       await prisma.workflow.deleteMany({});
       await prisma.session.deleteMany({});
       await prisma.user.deleteMany({});
@@ -181,6 +205,71 @@ describe.skipIf(!shouldRunIntegration)(
       const rawDbWorkflow = await prisma.workflow.findUnique({ where: { id: wfId } });
       expect(rawDbWorkflow).not.toBeNull();
       expect(rawDbWorkflow?.deletedAt).not.toBeNull();
+    });
+
+    it("executes full publish -> transactional outbox -> worker claim -> PostgreSQL run & node execution persistence", async () => {
+      const reg = await request(app).post("/api/auth/register").send({
+        email: "pg-runner@example.com",
+        password: "PostgresPassword123!"
+      });
+      const auth = extractCookies(reg.headers["set-cookie"]);
+
+      const createRes = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", auth.cookieHeader)
+        .set(CSRF_HEADER_NAME, auth.csrfToken)
+        .send({
+          name: "PG Durable Execution Flow",
+          draftDefinition: {
+            schemaVersion: 1,
+            nodes: [
+              { id: "trig", type: "manual_trigger", label: "Trigger", position: { x: 0, y: 0 }, config: { description: "" } },
+              {
+                id: "trans",
+                type: "data_transform",
+                label: "Transform",
+                position: { x: 200, y: 0 },
+                config: { mappings: [{ id: "m1", sourcePath: "trigger.payload.msg", targetKey: "resultMsg" }] }
+              }
+            ],
+            edges: [{ id: "e1", source: "trig", sourceHandle: "default", target: "trans", targetHandle: "default" }]
+          }
+        });
+      const wfId = createRes.body.workflow.id;
+
+      const pubRes = await request(app)
+        .post(`/api/workflows/${wfId}/publish`)
+        .set("Cookie", auth.cookieHeader)
+        .set(CSRF_HEADER_NAME, auth.csrfToken);
+      expect(pubRes.status).toBe(201);
+
+      const runRes = await request(app)
+        .post(`/api/workflows/${wfId}/runs`)
+        .set("Cookie", auth.cookieHeader)
+        .set(CSRF_HEADER_NAME, auth.csrfToken)
+        .send({ triggerPayload: { msg: "hello-postgres" } });
+      expect(runRes.status).toBe(202);
+      const runId = runRes.body.run.id;
+
+      const dispatcher = new OutboxDispatcher(
+        executionRepo,
+        { enqueueRunJob: async () => {} },
+        { dispatcherId: "pg_disp" }
+      );
+      const dispBatch = await dispatcher.dispatchBatch();
+      expect(dispBatch.delivered).toBe(1);
+
+      const processor = new WorkflowRunProcessor(executionRepo, {
+        workerId: "pg_worker"
+      });
+      const proc = await processor.processRun(runId);
+      expect(proc.status).toBe("COMPLETED");
+
+      const detailRes = await request(app)
+        .get(`/api/runs/${runId}`)
+        .set("Cookie", auth.cookieHeader);
+      expect(detailRes.status).toBe(200);
+      expect(detailRes.body.run.status).toBe("COMPLETED");
     });
   }
 );

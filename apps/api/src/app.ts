@@ -6,23 +6,29 @@ import type { AppConfig } from "./config.js";
 import type {
   UserRepository,
   SessionRepository,
-  WorkflowRepository
+  WorkflowRepository,
+  ExecutionRepository
 } from "./repositories/types.js";
 import { createAuthRouter } from "./routes/auth.js";
 import { createWorkflowRouter } from "./routes/workflows.js";
+import { createRunRouter } from "./routes/runs.js";
 
 export interface AppDependencies {
   config: AppConfig;
   userRepo: UserRepository;
   sessionRepo: SessionRepository;
   workflowRepo: WorkflowRepository;
+  executionRepo?: ExecutionRepository;
+  onRunQueued?: (runId: string) => void;
 }
 
 export function createApp({
   config,
   userRepo,
   sessionRepo,
-  workflowRepo
+  workflowRepo,
+  executionRepo,
+  onRunQueued
 }: AppDependencies): Express {
   const app = express();
 
@@ -49,20 +55,53 @@ export function createApp({
       },
       credentials: true,
       methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "X-CSRF-Token"]
+      allowedHeaders: ["Content-Type", "X-CSRF-Token", "X-Idempotency-Key"]
     })
   );
   app.use(cookieParser());
   app.use(express.json({ limit: "1mb" }));
 
-  // Healthcheck
-  app.get("/api/health", (_req: Request, res: Response) => {
-    res.status(200).json({ status: "ok", service: "@flowforge/api" });
+  // Health & Operational Metrics endpoint
+  app.get("/api/health", async (_req: Request, res: Response) => {
+    let outboxMetrics:
+      | {
+          pendingCount: number;
+          processingCount: number;
+          deliveredCount: number;
+          deadLetterCount: number;
+        }
+      | undefined;
+
+    if (executionRepo) {
+      try {
+        outboxMetrics = await executionRepo.getOutboxMetrics();
+      } catch {
+        // Non-fatal in health endpoint
+      }
+    }
+
+    res.status(200).json({
+      status: "ok",
+      service: "@flowforge/api",
+      ...(outboxMetrics ? { outbox: outboxMetrics } : {})
+    });
   });
 
   // Mount API routes
   app.use("/api/auth", createAuthRouter(userRepo, sessionRepo, config));
-  app.use("/api/workflows", createWorkflowRouter(workflowRepo, sessionRepo, config));
+  app.use(
+    "/api/workflows",
+    createWorkflowRouter(
+      workflowRepo,
+      sessionRepo,
+      config,
+      executionRepo,
+      onRunQueued
+    )
+  );
+  if (executionRepo) {
+    app.use("/api/runs", createRunRouter(executionRepo, sessionRepo, config));
+  }
 
   // 404 handler
   app.use((_req: Request, res: Response) => {

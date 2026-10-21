@@ -789,6 +789,55 @@ export interface ValidatedExecutableGraph {
 }
 
 /**
+ * Produces a deterministic, canonical JSON string representation of a validated
+ * executable graph so identical graphs produce identical SHA-256 content hashes.
+ */
+export function canonicalizeExecutableGraph(graph: {
+  schemaVersion: 1;
+  nodes: readonly EditorNode[];
+  edges: readonly EditorEdge[];
+}): string {
+  const sortedNodes = [...graph.nodes]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((n) => ({
+      id: n.id,
+      type: n.type,
+      label: n.label.trim(),
+      position: { x: n.position.x, y: n.position.y },
+      config: sortObjectKeys(n.config)
+    }));
+
+  const sortedEdges = [...graph.edges]
+    .sort((a, b) => a.id.localeCompare(b.id))
+    .map((e) => ({
+      id: e.id,
+      source: e.source,
+      sourceHandle: e.sourceHandle,
+      target: e.target,
+      targetHandle: e.targetHandle
+    }));
+
+  return JSON.stringify({
+    schemaVersion: 1,
+    nodes: sortedNodes,
+    edges: sortedEdges
+  });
+}
+
+function sortObjectKeys(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sortObjectKeys);
+  }
+  if (value && typeof value === "object") {
+    const entries = Object.entries(value as Record<string, unknown>).sort(([a], [b]) =>
+      a.localeCompare(b)
+    );
+    return Object.fromEntries(entries.map(([k, v]) => [k, sortObjectKeys(v)]));
+  }
+  return value;
+}
+
+/**
  * Validates whether a workflow graph is completely valid and ready for execution.
  * Unlike `DraftDefinitionSchema` (which allows saving incomplete work-in-progress),
  * execution readiness requires:
@@ -989,8 +1038,104 @@ export const WorkflowResponseSchema = z.object({
   name: z.string(),
   description: z.string().nullable(),
   draftDefinition: z.unknown(),
+  publishedVersionId: z.string().uuid().nullable().optional(),
+  publishedVersionNumber: z.number().int().positive().nullable().optional(),
   createdAt: z.string(),
   updatedAt: z.string()
 });
 
 export type WorkflowResponse = z.infer<typeof WorkflowResponseSchema>;
+
+export const WorkflowVersionResponseSchema = z.object({
+  id: z.string().uuid(),
+  workflowId: z.string().uuid(),
+  versionNumber: z.number().int().positive(),
+  contentHash: z.string().min(1),
+  definition: z.unknown(),
+  createdAt: z.string()
+});
+
+export type WorkflowVersionResponse = z.infer<typeof WorkflowVersionResponseSchema>;
+
+export const WorkflowRunStatusEnum = z.enum([
+  "QUEUED",
+  "RUNNING",
+  "COMPLETED",
+  "FAILED",
+  "CANCELLED"
+]);
+export type WorkflowRunStatus = z.infer<typeof WorkflowRunStatusEnum>;
+
+export const NodeExecutionStatusEnum = z.enum([
+  "PENDING",
+  "RUNNING",
+  "COMPLETED",
+  "FAILED",
+  "SKIPPED",
+  "CANCELLED"
+]);
+export type NodeExecutionStatusContract = z.infer<typeof NodeExecutionStatusEnum>;
+
+export const CreateWorkflowRunRequestSchema = z.object({
+  triggerPayload: z.record(z.string(), z.unknown()).default({}),
+  versionId: z.string().uuid().optional(),
+  idempotencyKey: z.string().trim().min(1).max(128).optional()
+});
+export type CreateWorkflowRunRequest = z.infer<typeof CreateWorkflowRunRequestSchema>;
+
+export const NodeExecutionResponseSchema = z.object({
+  id: z.string().uuid(),
+  runId: z.string().uuid(),
+  nodeId: z.string(),
+  nodeType: WorkflowNodeTypeEnum,
+  label: z.string(),
+  status: NodeExecutionStatusEnum,
+  attemptCount: z.number().int().nonnegative(),
+  startedAt: z.string().nullable(),
+  completedAt: z.string().nullable(),
+  durationMs: z.number().int().nonnegative().nullable(),
+  input: z.record(z.string(), z.unknown()).nullable(),
+  output: z.record(z.string(), z.unknown()).nullable(),
+  selectedBranch: z.enum(["true", "false"]).nullable().optional(),
+  skipReason: z.string().nullable().optional(),
+  error: z
+    .object({
+      code: z.string(),
+      message: z.string(),
+      nodeId: z.string().optional(),
+      details: z.unknown().optional()
+    })
+    .nullable()
+    .optional()
+});
+export type NodeExecutionResponse = z.infer<typeof NodeExecutionResponseSchema>;
+
+export const WorkflowRunResponseSchema = z.object({
+  id: z.string().uuid(),
+  workflowId: z.string().uuid(),
+  workflowVersionId: z.string().uuid(),
+  versionNumber: z.number().int().positive(),
+  userId: z.string().uuid(),
+  status: WorkflowRunStatusEnum,
+  triggerPayload: z.record(z.string(), z.unknown()),
+  idempotencyKey: z.string().nullable().optional(),
+  attemptCount: z.number().int().nonnegative(),
+  maxAttempts: z.number().int().positive(),
+  startedAt: z.string().nullable(),
+  completedAt: z.string().nullable(),
+  cancelledAt: z.string().nullable().optional(),
+  durationMs: z.number().int().nonnegative().nullable(),
+  error: z
+    .object({
+      code: z.string(),
+      message: z.string(),
+      nodeId: z.string().optional(),
+      details: z.unknown().optional()
+    })
+    .nullable()
+    .optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  nodeExecutions: z.array(NodeExecutionResponseSchema).optional()
+});
+export type WorkflowRunResponse = z.infer<typeof WorkflowRunResponseSchema>;

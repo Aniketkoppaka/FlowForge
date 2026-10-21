@@ -9,6 +9,10 @@ import type {
   NodeHandlerRegistry
 } from "./types.js";
 import { resolveDataPath } from "./data-flow.js";
+import {
+  executeSafeHttpRequest,
+  SafeHttpError
+} from "./http-client.js";
 
 type ManualTriggerNode = Extract<EditorNode, { type: "manual_trigger" }>;
 type ConditionNode = Extract<EditorNode, { type: "condition" }>;
@@ -173,10 +177,9 @@ export const executeDataTransformNode: NodeHandler<DataTransformNode> = (
 };
 
 /**
- * 4. HTTP Request Node Handler (Fail-Closed Contract in Milestone 3)
- * Defines the handler contract and input/output semantics, and fails closed with
- * `NODE_NOT_SUPPORTED` until the SSRF-hardened outbound HTTP client is enabled in Milestone 4/6.
- * Never performs unsafe outbound network calls or simulates fake 200 responses.
+ * 4. HTTP Request Node Handler (Fail-Closed Default + SSRF-Hardened Outbound Client)
+ * By default (`createDefaultNodeHandlerRegistry()`), outbound HTTP requests fail closed
+ * with `NODE_NOT_SUPPORTED` unless explicitly enabled via `createHardenedHttpRequestHandler()`.
  */
 export const executeHttpRequestNode: NodeHandler<HttpRequestNode> = (
   node,
@@ -187,7 +190,7 @@ export const executeHttpRequestNode: NodeHandler<HttpRequestNode> = (
     error: {
       code: "NODE_NOT_SUPPORTED",
       nodeId: node.id,
-      message: `HTTP Request node '${node.label}' (${node.id}) cannot execute: outbound HTTP requests are disabled until the SSRF-hardened HTTP client is enabled.`,
+      message: `HTTP Request node '${node.label}' (${node.id}) cannot execute: outbound HTTP requests are disabled unless the SSRF-hardened HTTP client is explicitly enabled.`,
       details: {
         method: node.config.method,
         url: node.config.url
@@ -196,11 +199,99 @@ export const executeHttpRequestNode: NodeHandler<HttpRequestNode> = (
   };
 };
 
-export function createDefaultNodeHandlerRegistry(): NodeHandlerRegistry {
+export interface HardenedHttpHandlerOptions {
+  timeoutMs?: number;
+  maxResponseBytes?: number;
+  resolveHostname?: (hostname: string) => Promise<Array<{ address: string; family: 4 | 6 }>>;
+}
+
+/**
+ * Creates a real outbound HTTP Request node handler backed by `executeSafeHttpRequest`
+ * with full SSRF validation, DNS pinning, redirect blocking, header redaction, and size/timeout ceilings.
+ */
+export function createHardenedHttpRequestHandler(
+  options: HardenedHttpHandlerOptions = {}
+): NodeHandler<HttpRequestNode> {
+  return async (node): Promise<NodeHandlerResult> => {
+    try {
+      const response = await executeSafeHttpRequest({
+        method: node.config.method,
+        url: node.config.url,
+        headers: node.config.headers,
+        body: node.config.body,
+        timeoutMs: options.timeoutMs,
+        maxResponseBytes: options.maxResponseBytes,
+        resolveHostname: options.resolveHostname
+      });
+
+      const outputPayload: Record<string, unknown> = {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers,
+        body: response.body,
+        truncated: response.truncated,
+        durationMs: response.durationMs,
+        requestHeaders: response.redactedRequestHeaders
+      };
+
+      if (response.status >= 400) {
+        return {
+          status: "FAILED",
+          output: outputPayload,
+          error: {
+            code: "HTTP_STATUS_ERROR",
+            nodeId: node.id,
+            message: `HTTP Request node '${node.label}' (${node.id}) received error status ${response.status}.`,
+            details: {
+              status: response.status,
+              statusText: response.statusText
+            }
+          }
+        };
+      }
+
+      return {
+        status: "COMPLETED",
+        output: outputPayload
+      };
+    } catch (err) {
+      if (err instanceof SafeHttpError) {
+        return {
+          status: "FAILED",
+          error: {
+            code: err.code,
+            nodeId: node.id,
+            message: err.message,
+            details: err.details
+          }
+        };
+      }
+
+      return {
+        status: "FAILED",
+        error: {
+          code: "HTTP_NETWORK_ERROR",
+          nodeId: node.id,
+          message:
+            err instanceof Error
+              ? err.message
+              : "Unexpected outbound HTTP execution error"
+        }
+      };
+    }
+  };
+}
+
+export function createDefaultNodeHandlerRegistry(options?: {
+  enableOutboundHttp?: boolean;
+  httpOptions?: HardenedHttpHandlerOptions;
+}): NodeHandlerRegistry {
   return {
     manual_trigger: executeManualTriggerNode,
     condition: executeConditionNode,
     data_transform: executeDataTransformNode,
-    http_request: executeHttpRequestNode
+    http_request: options?.enableOutboundHttp
+      ? createHardenedHttpRequestHandler(options.httpOptions)
+      : executeHttpRequestNode
   };
 }

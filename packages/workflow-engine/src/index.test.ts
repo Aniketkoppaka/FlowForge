@@ -4,6 +4,10 @@ import {
   executeWorkflowGraph,
   resolveDataPath,
   evaluateConditionOperator,
+  isProhibitedIpAddress,
+  validateTargetUrlSyntax,
+  executeSafeHttpRequest,
+  createDefaultNodeHandlerRegistry,
   type ExecutionDataStore
 } from "./index.js";
 
@@ -432,6 +436,123 @@ describe("@flowforge/workflow-engine — Milestone 3 Validation & Execution Suit
       expect(res.status).toBe("FAILED");
       expect(res.error?.code).toBe("VALIDATION_FAILED");
       expect(res.nodeResults).toHaveLength(0);
+    });
+  });
+
+  describe("6. SSRF-Hardened HTTP Client Security & Regression Suite", () => {
+    it("blocks loopback, RFC1918 private, link-local, cloud metadata, CGNAT, multicast, and IPv4-mapped IPv6 addresses", () => {
+      const blockedIps = [
+        "127.0.0.1",
+        "127.255.255.254",
+        "0.0.0.0",
+        "10.0.0.1",
+        "10.255.255.255",
+        "172.16.0.1",
+        "172.31.255.254",
+        "192.168.0.1",
+        "192.168.100.50",
+        "169.254.169.254", // AWS/GCP/Azure Cloud Metadata
+        "100.100.100.200", // Alibaba Cloud Metadata
+        "100.64.0.1",      // CGNAT
+        "198.18.0.1",      // Benchmarking
+        "224.0.0.1",       // Multicast
+        "255.255.255.255", // Broadcast
+        "::1",
+        "::",
+        "::ffff:127.0.0.1",
+        "::ffff:169.254.169.254",
+        "::ffff:10.0.0.1",
+        "fe80::1",
+        "fc00::1",
+        "fd00:ec2::254",   // AWS IPv6 Metadata
+        "2001:db8::1"
+      ];
+
+      for (const ip of blockedIps) {
+        const res = isProhibitedIpAddress(ip);
+        expect(res.prohibited, `Expected IP '${ip}' to be prohibited`).toBe(true);
+      }
+
+      const publicIps = ["93.184.216.34", "8.8.8.8", "2606:2800:220:1:248:1893:25c8:1946"];
+      for (const ip of publicIps) {
+        expect(isProhibitedIpAddress(ip).prohibited).toBe(false);
+      }
+    });
+
+    it("rejects non-http protocols, embedded credentials, internal hostnames, and octal/hex IP encodings", () => {
+      const forbiddenUrls = [
+        "file:///etc/passwd",
+        "ftp://example.com/data",
+        "gopher://127.0.0.1:6379/_INFO",
+        "https://user:password@example.com/api",
+        "http://localhost:4000/api/health",
+        "http://sub.localhost/admin",
+        "http://metadata.google.internal/computeMetadata/v1/",
+        "http://2130706433/",       // Decimal 127.0.0.1
+        "http://0x7f000001/",       // Hex 127.0.0.1
+        "http://0177.0.0.1/"        // Octal 127.0.0.1
+      ];
+
+      for (const badUrl of forbiddenUrls) {
+        expect(() => validateTargetUrlSyntax(badUrl)).toThrow();
+      }
+    });
+
+    it("blocks mixed public/private DNS answers to defeat DNS rebinding", async () => {
+      await expect(
+        executeSafeHttpRequest({
+          method: "GET",
+          url: "https://rebinding.example.com/webhook",
+          resolveHostname: async () => [
+            { address: "93.184.216.34", family: 4 },
+            { address: "169.254.169.254", family: 4 } // Mixed metadata IP in DNS answer
+          ]
+        })
+      ).rejects.toMatchObject({
+        code: "SSRF_BLOCKED_IP"
+      });
+    });
+
+    it("surfaces SSRF_BLOCKED_IP in WorkflowExecutionResult when hardened HTTP handler is enabled and targets a private IP", async () => {
+      const ssrfGraph = {
+        schemaVersion: 1,
+        nodes: [
+          {
+            id: "trig",
+            type: "manual_trigger",
+            label: "Start",
+            position: { x: 0, y: 0 },
+            config: { description: "" }
+          },
+          {
+            id: "http_ssrf",
+            type: "http_request",
+            label: "Attempt Metadata Access",
+            position: { x: 240, y: 0 },
+            config: {
+              method: "GET",
+              url: "http://169.254.169.254/latest/meta-data/",
+              headers: [],
+              body: ""
+            }
+          }
+        ],
+        edges: [
+          { id: "e1", source: "trig", sourceHandle: "default", target: "http_ssrf", targetHandle: "default" }
+        ]
+      };
+
+      const res = await executeWorkflowGraph(
+        ssrfGraph,
+        { now: fixedNow },
+        {
+          handlers: createDefaultNodeHandlerRegistry({ enableOutboundHttp: true })
+        }
+      );
+
+      expect(res.status).toBe("FAILED");
+      expect(res.error?.code).toBe("SSRF_BLOCKED_IP");
+      expect(res.error?.nodeId).toBe("http_ssrf");
     });
   });
 });

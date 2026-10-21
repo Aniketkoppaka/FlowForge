@@ -151,9 +151,9 @@ describe("@flowforge/web — Dashboard & Visual Workflow Editor Suite", () => {
       expect(await screen.findByTestId("empty-canvas-guidance")).toBeInTheDocument();
       expect(screen.getByTestId("save-status-indicator")).toHaveTextContent("Saved");
 
-      // Run button is disabled with clear explanation
+      // Run button is disabled until a version is published
       const runBtn = screen.getByRole("button", {
-        name: /Run Workflow \(Execution not implemented yet\)/i
+        name: /Run Workflow \(Publish a version first\)/i
       });
       expect(runBtn).toBeDisabled();
 
@@ -429,6 +429,222 @@ describe("@flowforge/web — Dashboard & Visual Workflow Editor Suite", () => {
         expect(updateSpy).toHaveBeenCalledTimes(1);
         expect(screen.getByTestId("save-status-indicator")).toHaveTextContent("Saved");
       });
+    });
+
+    it("publishes an immutable version, runs that version, and inspects node execution results including a SKIPPED branch", async () => {
+      vi.spyOn(apiClient, "getMe").mockResolvedValue({
+        user: {
+          id: "00000000-0000-0000-0000-000000000001",
+          email: "dev@flowforge.io",
+          name: "Dev",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        },
+        csrfToken: "csrf-123"
+      });
+
+      vi.spyOn(apiClient, "getWorkflow").mockResolvedValue({
+        workflow: {
+          id: wfId,
+          userId: "00000000-0000-0000-0000-000000000001",
+          name: "Enterprise Order Router",
+          description: "Routes VIP vs Standard orders",
+          draftDefinition: {
+            schemaVersion: 1,
+            nodes: [
+              {
+                id: "trig_1",
+                type: "manual_trigger",
+                label: "Manual Trigger",
+                position: { x: 80, y: 120 },
+                config: { description: "Entry" }
+              },
+              {
+                id: "cond_1",
+                type: "condition",
+                label: "Is VIP Order?",
+                position: { x: 320, y: 120 },
+                config: {
+                  leftOperand: "trigger.payload.tier",
+                  operator: "equals",
+                  rightOperand: "vip"
+                }
+              },
+              {
+                id: "trans_true",
+                type: "data_transform",
+                label: "VIP Enrichment",
+                position: { x: 580, y: 60 },
+                config: {
+                  mappings: [{ id: "m1", sourcePath: "trigger.payload.orderId", targetKey: "vipOrderId" }]
+                }
+              },
+              {
+                id: "trans_false",
+                type: "data_transform",
+                label: "Standard Enrichment",
+                position: { x: 580, y: 200 },
+                config: {
+                  mappings: [{ id: "m2", sourcePath: "trigger.payload.orderId", targetKey: "stdOrderId" }]
+                }
+              }
+            ],
+            edges: [
+              { id: "e1", source: "trig_1", sourceHandle: "default", target: "cond_1", targetHandle: "default" },
+              { id: "e2", source: "cond_1", sourceHandle: "true", target: "trans_true", targetHandle: "default" },
+              { id: "e3", source: "cond_1", sourceHandle: "false", target: "trans_false", targetHandle: "default" }
+            ]
+          },
+          publishedVersionId: null,
+          publishedVersionNumber: null,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }
+      });
+
+      vi.spyOn(apiClient, "listWorkflowRuns").mockResolvedValue({
+        runs: [],
+        pagination: { total: 0, limit: 15, offset: 0 }
+      });
+
+      const publishSpy = vi.spyOn(apiClient, "publishWorkflow").mockResolvedValue({
+        workflow: {
+          id: wfId,
+          userId: "00000000-0000-0000-0000-000000000001",
+          name: "Enterprise Order Router",
+          description: "Routes VIP vs Standard orders",
+          draftDefinition: {},
+          publishedVersionId: "00000000-0000-0000-0000-000000000201",
+          publishedVersionNumber: 1,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        },
+        version: {
+          id: "00000000-0000-0000-0000-000000000201",
+          workflowId: wfId,
+          versionNumber: 1,
+          contentHash: "abc123hash",
+          definition: {},
+          createdAt: new Date().toISOString()
+        },
+        alreadyPublished: false
+      });
+
+      const runId = "00000000-0000-0000-0000-000000000301";
+      const completedRunMock = {
+        id: runId,
+        workflowId: wfId,
+        workflowVersionId: "00000000-0000-0000-0000-000000000201",
+        versionNumber: 1,
+        userId: "00000000-0000-0000-0000-000000000001",
+        status: "COMPLETED" as const,
+        triggerPayload: { tier: "vip", orderId: "ORD-777" },
+        attemptCount: 1,
+        maxAttempts: 3,
+        startedAt: new Date().toISOString(),
+        completedAt: new Date().toISOString(),
+        durationMs: 18,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        nodeExecutions: [
+          {
+            id: "00000000-0000-0000-0000-000000000401",
+            runId,
+            nodeId: "trig_1",
+            nodeType: "manual_trigger" as const,
+            label: "Manual Trigger",
+            status: "COMPLETED" as const,
+            attemptCount: 1,
+            startedAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+            durationMs: 2,
+            input: { tier: "vip", orderId: "ORD-777" },
+            output: { payload: { tier: "vip", orderId: "ORD-777" } }
+          },
+          {
+            id: "00000000-0000-0000-0000-000000000402",
+            runId,
+            nodeId: "cond_1",
+            nodeType: "condition" as const,
+            label: "Is VIP Order?",
+            status: "COMPLETED" as const,
+            attemptCount: 1,
+            startedAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+            durationMs: 3,
+            input: {},
+            output: { matched: true, branch: "true" },
+            selectedBranch: "true" as const
+          },
+          {
+            id: "00000000-0000-0000-0000-000000000403",
+            runId,
+            nodeId: "trans_true",
+            nodeType: "data_transform" as const,
+            label: "VIP Enrichment",
+            status: "COMPLETED" as const,
+            attemptCount: 1,
+            startedAt: new Date().toISOString(),
+            completedAt: new Date().toISOString(),
+            durationMs: 4,
+            input: {},
+            output: { vipOrderId: "ORD-777" }
+          },
+          {
+            id: "00000000-0000-0000-0000-000000000404",
+            runId,
+            nodeId: "trans_false",
+            nodeType: "data_transform" as const,
+            label: "Standard Enrichment",
+            status: "SKIPPED" as const,
+            attemptCount: 1,
+            startedAt: null,
+            completedAt: null,
+            durationMs: null,
+            input: null,
+            output: null,
+            skipReason: "Skipped because condition 'cond_1' evaluated to 'true' (branch 'false' was not selected)."
+          }
+        ]
+      };
+
+      vi.spyOn(apiClient, "createWorkflowRun").mockResolvedValue({
+        run: completedRunMock,
+        reusedIdempotentRun: false
+      });
+
+      vi.spyOn(apiClient, "getWorkflowRun").mockResolvedValue({
+        run: completedRunMock
+      });
+
+      render(<WorkflowEditor workflowId={wfId} />);
+
+      expect(
+        await screen.findByDisplayValue("Enterprise Order Router")
+      ).toBeInTheDocument();
+
+      // Click Publish Version
+      fireEvent.click(screen.getByRole("button", { name: /Publish Version/i }));
+
+      await waitFor(() => {
+        expect(publishSpy).toHaveBeenCalledWith(wfId);
+        expect(screen.getByTestId("published-version-badge")).toHaveTextContent(
+          "Published v1"
+        );
+      });
+
+      // Run button is now enabled as "Run v1"
+      const runV1Btn = screen.getByRole("button", { name: /Run Workflow v1/i });
+      expect(runV1Btn).not.toBeDisabled();
+      fireEvent.click(runV1Btn);
+
+      // Execution Inspector opens and displays the run + node statuses including SKIPPED branch
+      expect(
+        await screen.findByTestId("execution-inspector-panel")
+      ).toBeInTheDocument();
+      expect(screen.getByTestId("selected-run-status")).toHaveTextContent("COMPLETED");
+      expect(screen.getByTestId("node-exec-card-trans_true")).toHaveTextContent("COMPLETED");
+      expect(screen.getByTestId("node-exec-card-trans_false")).toHaveTextContent("SKIPPED");
     });
   });
 });

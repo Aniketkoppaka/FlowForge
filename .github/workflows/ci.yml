@@ -6,9 +6,12 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
 jobs:
   verify:
-    name: Lint, Typecheck, Test & Build
+    name: Lint, Typecheck, Test, DB Integration & Build
     runs-on: ubuntu-latest
 
     services:
@@ -26,8 +29,19 @@ jobs:
           --health-timeout=5s
           --health-retries=10
 
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=3s
+          --health-retries=10
+
     env:
       DATABASE_URL: "postgresql://flowforge:flowforge_test_password@localhost:5432/flowforge_test?schema=public"
+      REDIS_URL: "redis://localhost:6379"
       NODE_ENV: "test"
       RUN_DB_INTEGRATION_TESTS: "true"
       SESSION_SECRET: "ci-test-session-secret-minimum-32-chars-flowforge"
@@ -43,10 +57,10 @@ jobs:
           node-version: "22"
           cache: "npm"
 
-      - name: Install dependencies
+      - name: Install dependencies from lockfile
         run: npm ci
 
-      - name: Generate Prisma Client & Apply Migrations
+      - name: Generate Prisma Client & Apply All Migrations on Empty Database
         run: |
           npm run db:generate
           npm run db:migrate:deploy
@@ -57,8 +71,13 @@ jobs:
       - name: Run Typecheck
         run: npm run typecheck
 
-      - name: Run Automated Tests
-        run: npm run test
+      - name: Run Unit, API, Engine, Worker, and Live PostgreSQL Integration Tests
+        run: |
+          if [ "$RUN_DB_INTEGRATION_TESTS" != "true" ]; then
+            echo "ERROR: RUN_DB_INTEGRATION_TESTS must be 'true' in CI"
+            exit 1
+          fi
+          npm run test
 
       - name: Run Production Build
         run: npm run build

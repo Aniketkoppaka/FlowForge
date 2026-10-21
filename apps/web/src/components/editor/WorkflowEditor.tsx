@@ -18,6 +18,7 @@ import {
   type EditorNode,
   type EditorEdge,
   type WorkflowNodeType,
+  type WorkflowRunResponse,
   normalizeDraftDefinition,
   createDefaultEditorNode,
   validateGraphConnection,
@@ -31,6 +32,7 @@ import {
 } from "./FlowForgeCanvasNode";
 import { NodePalette } from "./NodePalette";
 import { NodeConfigurationPanel } from "./NodeConfigurationPanel";
+import { ExecutionInspectorPanel } from "./ExecutionInspectorPanel";
 
 export type SaveStatus = "saved" | "unsaved" | "saving" | "error";
 
@@ -69,6 +71,15 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
   const [normalizationWarnings, setNormalizationWarnings] = useState<string[]>([]);
   const [isCorruptedDraftLocked, setIsCorruptedDraftLocked] = useState(false);
 
+  // Publishing & Execution Inspector State
+  const [publishedVersionId, setPublishedVersionId] = useState<string | null>(null);
+  const [publishedVersionNumber, setPublishedVersionNumber] = useState<number | null>(null);
+  const [publishing, setPublishing] = useState(false);
+  const [triggeringRun, setTriggeringRun] = useState(false);
+  const [runs, setRuns] = useState<WorkflowRunResponse[]>([]);
+  const [selectedRun, setSelectedRun] = useState<WorkflowRunResponse | null>(null);
+  const [showInspector, setShowInspector] = useState(false);
+
   // Monotonically increasing revision counter to prevent stale saves from clobbering newer edits
   const editRevisionRef = useRef(0);
   const inFlightSavePromiseRef = useRef<Promise<void> | null>(null);
@@ -100,11 +111,20 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
       setEditorEdges(normalized.edges);
       setNormalizationWarnings(normalized.warnings);
       setIsCorruptedDraftLocked(normalized.isCorrupted);
+      setPublishedVersionId(wf.publishedVersionId ?? null);
+      setPublishedVersionNumber(wf.publishedVersionNumber ?? null);
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
       editRevisionRef.current = 0;
       setSaveStatus("saved");
       setSaveError(null);
+
+      try {
+        const runsRes = await apiClient.listWorkflowRuns(workflowId, { limit: 15 });
+        setRuns(runsRes.runs);
+      } catch {
+        // Optional when execution history endpoint is not mocked in unit tests
+      }
     } catch (err) {
       if (err instanceof ApiClientError && err.status === 401) {
         setLoadError("Authentication required. Please sign in from the Workflows dashboard.");
@@ -381,6 +401,114 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
     markDirty();
   }, [markDirty]);
 
+  // Publish Workflow Version
+  const handlePublish = useCallback(async () => {
+    if (publishing || isCorruptedDraftLocked) return;
+    setPublishing(true);
+    setSaveError(null);
+    setConnectionFeedback(null);
+    try {
+      // Save unsaved changes first so server publishes the current canvas state
+      if (saveStatus === "unsaved") {
+        await handleSave();
+      }
+      const res = await apiClient.publishWorkflow(workflowId);
+      setPublishedVersionId(res.version.id);
+      setPublishedVersionNumber(res.version.versionNumber);
+      setConnectionFeedback(
+        res.alreadyPublished
+          ? `Version v${res.version.versionNumber} is already current (no graph changes).`
+          : `Published immutable Version v${res.version.versionNumber}.`
+      );
+    } catch (err) {
+      setSaveError(
+        err instanceof Error ? err.message : "Failed to publish workflow version."
+      );
+    } finally {
+      setPublishing(false);
+    }
+  }, [publishing, isCorruptedDraftLocked, saveStatus, handleSave, workflowId]);
+
+  // Select and inspect a specific run
+  const handleSelectRun = useCallback(async (runId: string) => {
+    try {
+      const res = await apiClient.getWorkflowRun(runId);
+      setSelectedRun(res.run);
+      setShowInspector(true);
+      setRuns((prev) =>
+        prev.some((r) => r.id === res.run.id)
+          ? prev.map((r) => (r.id === res.run.id ? res.run : r))
+          : [res.run, ...prev]
+      );
+    } catch (err) {
+      setSaveError(
+        err instanceof Error ? err.message : "Failed to load run details."
+      );
+    }
+  }, []);
+
+  // Trigger a workflow run on the current published version
+  const handleTriggerRun = useCallback(async () => {
+    if (!publishedVersionId || triggeringRun) return;
+    setTriggeringRun(true);
+    setSaveError(null);
+    try {
+      const created = await apiClient.createWorkflowRun(workflowId, {
+        versionId: publishedVersionId,
+        triggerPayload: {
+          triggeredBy: "editor_manual_run",
+          timestamp: new Date().toISOString()
+        }
+      });
+      await handleSelectRun(created.run.id);
+    } catch (err) {
+      setSaveError(
+        err instanceof Error ? err.message : "Failed to start workflow run."
+      );
+    } finally {
+      setTriggeringRun(false);
+    }
+  }, [publishedVersionId, triggeringRun, workflowId, handleSelectRun]);
+
+  // Cancel an active run
+  const handleCancelRun = useCallback(async (runId: string) => {
+    try {
+      const res = await apiClient.cancelWorkflowRun(runId);
+      setSelectedRun((prev) =>
+        prev && prev.id === runId ? { ...prev, ...res.run } : prev
+      );
+      setRuns((prev) => prev.map((r) => (r.id === runId ? res.run : r)));
+    } catch (err) {
+      setSaveError(
+        err instanceof Error ? err.message : "Failed to cancel workflow run."
+      );
+    }
+  }, []);
+
+  // Poll active selectedRun while it is QUEUED or RUNNING, and stop immediately once terminal
+  useEffect(() => {
+    if (
+      !selectedRun ||
+      (selectedRun.status !== "QUEUED" && selectedRun.status !== "RUNNING")
+    ) {
+      return;
+    }
+
+    const timer = setInterval(async () => {
+      try {
+        const res = await apiClient.getWorkflowRun(selectedRun.id);
+        setSelectedRun(res.run);
+        setRuns((prev) =>
+          prev.map((r) => (r.id === res.run.id ? res.run : r))
+        );
+      } catch {
+        // Stop or ignore transient poll failure
+      }
+    }, 1500);
+
+    return () => clearInterval(timer);
+  }, [selectedRun]);
+
   // Convert EditorNodes / EditorEdges to React Flow format
   const rfNodes: Node<FlowForgeNodeData>[] = useMemo(
     () =>
@@ -604,6 +732,23 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
           >
             {statusBadge.text}
           </span>
+
+          {publishedVersionNumber !== null && (
+            <span
+              data-testid="published-version-badge"
+              style={{
+                fontSize: "0.72rem",
+                fontWeight: 700,
+                padding: "0.2rem 0.55rem",
+                borderRadius: "999px",
+                backgroundColor: "rgba(56, 189, 248, 0.14)",
+                color: "#38bdf8",
+                whiteSpace: "nowrap"
+              }}
+            >
+              Published v{publishedVersionNumber}
+            </span>
+          )}
         </div>
 
         <div style={{ display: "flex", alignItems: "center", gap: "0.6rem" }}>
@@ -664,21 +809,83 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
 
           <button
             type="button"
-            disabled
-            title="Workflow execution UI is scheduled for Milestone 4 (Asynchronous Queue & Execution History)."
-            aria-label="Run Workflow (Execution not implemented yet)"
+            onClick={() => void handlePublish()}
+            disabled={publishing || isCorruptedDraftLocked}
             style={{
               padding: "0.45rem 0.9rem",
               backgroundColor: "var(--ff-bg-elevated)",
-              color: "var(--ff-text-muted)",
+              color: isCorruptedDraftLocked
+                ? "var(--ff-text-muted)"
+                : "var(--ff-text-primary)",
               border: "1px solid var(--ff-border-subtle)",
               borderRadius: "6px",
               fontSize: "0.8rem",
-              fontWeight: 600,
-              cursor: "not-allowed"
+              fontWeight: 700,
+              cursor:
+                publishing || isCorruptedDraftLocked
+                  ? "not-allowed"
+                  : "pointer"
             }}
           >
-            Run (Milestone 4)
+            {publishing ? "Publishing..." : "Publish Version"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => void handleTriggerRun()}
+            disabled={!publishedVersionId || triggeringRun}
+            title={
+              publishedVersionId
+                ? `Queue an execution run against published version v${publishedVersionNumber}`
+                : "Publish a workflow version first before running."
+            }
+            aria-label={
+              publishedVersionId
+                ? `Run Workflow v${publishedVersionNumber}`
+                : "Run Workflow (Publish a version first)"
+            }
+            style={{
+              padding: "0.45rem 0.9rem",
+              backgroundColor: publishedVersionId
+                ? "#22c55e"
+                : "var(--ff-bg-elevated)",
+              color: publishedVersionId ? "#052e16" : "var(--ff-text-muted)",
+              border: publishedVersionId
+                ? "none"
+                : "1px solid var(--ff-border-subtle)",
+              borderRadius: "6px",
+              fontSize: "0.8rem",
+              fontWeight: 700,
+              cursor:
+                !publishedVersionId || triggeringRun
+                  ? "not-allowed"
+                  : "pointer"
+            }}
+          >
+            {triggeringRun
+              ? "Queueing..."
+              : publishedVersionNumber
+                ? `Run v${publishedVersionNumber}`
+                : "Run Workflow"}
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setShowInspector((prev) => !prev)}
+            style={{
+              padding: "0.45rem 0.75rem",
+              backgroundColor: showInspector
+                ? "rgba(56, 189, 248, 0.16)"
+                : "var(--ff-bg-elevated)",
+              color: showInspector ? "#38bdf8" : "var(--ff-text-secondary)",
+              border: "1px solid var(--ff-border-subtle)",
+              borderRadius: "6px",
+              fontSize: "0.78rem",
+              fontWeight: 600,
+              cursor: "pointer"
+            }}
+          >
+            Runs ({runs.length})
           </button>
         </div>
       </header>
@@ -849,6 +1056,16 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
             onUpdateNode={handleUpdateNode}
             onDeleteNode={handleDeleteNode}
             onClose={() => setSelectedNodeId(null)}
+          />
+        )}
+
+        {showInspector && (
+          <ExecutionInspectorPanel
+            runs={runs}
+            selectedRun={selectedRun}
+            onSelectRun={(runId) => void handleSelectRun(runId)}
+            onCancelRun={(runId) => void handleCancelRun(runId)}
+            onClose={() => setShowInspector(false)}
           />
         )}
       </div>

@@ -6,8 +6,14 @@ import { loadConfig } from "./config.js";
 import {
   InMemoryUserRepository,
   InMemorySessionRepository,
-  InMemoryWorkflowRepository
+  InMemoryWorkflowRepository,
+  InMemoryExecutionRepository
 } from "./repositories/memory-repositories.js";
+import {
+  OutboxDispatcher,
+  WorkflowRunProcessor,
+  type QueueJobPayload
+} from "./services/execution-orchestrator.js";
 import {
   SESSION_COOKIE_NAME,
   CSRF_COOKIE_NAME,
@@ -50,6 +56,7 @@ describe("@flowforge/api — Authentication, Session Revocation, Security & Work
   let userRepo: InMemoryUserRepository;
   let sessionRepo: InMemorySessionRepository;
   let workflowRepo: InMemoryWorkflowRepository;
+  let executionRepo: InMemoryExecutionRepository;
 
   const testConfig = loadConfig({
     NODE_ENV: "test",
@@ -63,7 +70,14 @@ describe("@flowforge/api — Authentication, Session Revocation, Security & Work
     userRepo = new InMemoryUserRepository();
     sessionRepo = new InMemorySessionRepository();
     workflowRepo = new InMemoryWorkflowRepository();
-    app = createApp({ config: testConfig, userRepo, sessionRepo, workflowRepo });
+    executionRepo = new InMemoryExecutionRepository(workflowRepo);
+    app = createApp({
+      config: testConfig,
+      userRepo,
+      sessionRepo,
+      workflowRepo,
+      executionRepo
+    });
   });
 
   describe("1. Authentication & Server-Side Session Revocation Lifecycle", () => {
@@ -637,6 +651,360 @@ describe("@flowforge/api — Authentication, Session Revocation, Security & Work
         });
       expect(badConditionHandle.status).toBe(400);
       expect(badConditionHandle.body.error.code).toBe("VALIDATION_ERROR");
+    });
+
+    it("publishes immutable workflow versions, pins runs to exact versions, enforces idempotency keys, and prevents draft edits from mutating queued runs", async () => {
+      const userA = await registerAndGetAuth("publisher@example.com");
+      const userB = await registerAndGetAuth("outsider@example.com");
+
+      // 1. Create workflow with an incomplete draft (missing trigger)
+      const createRes = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({
+          name: "Versioned Order Pipeline",
+          draftDefinition: {
+            schemaVersion: 1,
+            nodes: [
+              {
+                id: "trans_1",
+                type: "data_transform",
+                label: "Map Order",
+                position: { x: 200, y: 100 },
+                config: {
+                  mappings: [{ id: "m1", sourcePath: "trigger.payload.orderId", targetKey: "id" }]
+                }
+              }
+            ],
+            edges: []
+          }
+        });
+      expect(createRes.status).toBe(201);
+      const wfId = createRes.body.workflow.id;
+
+      // 2. Attempting to run before publishing is rejected with 400 WORKFLOW_NOT_PUBLISHED
+      const runBeforePub = await request(app)
+        .post(`/api/workflows/${wfId}/runs`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({ triggerPayload: { orderId: "ORD-1" } });
+      expect(runBeforePub.status).toBe(400);
+      expect(runBeforePub.body.error.code).toBe("WORKFLOW_NOT_PUBLISHED");
+
+      // 3. Attempting to publish incomplete draft (missing manual_trigger) fails with 400 PUBLISH_VALIDATION_ERROR
+      const badPub = await request(app)
+        .post(`/api/workflows/${wfId}/publish`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken);
+      expect(badPub.status).toBe(400);
+      expect(badPub.body.error.code).toBe("PUBLISH_VALIDATION_ERROR");
+
+      // 4. Update draft to a complete executable graph (v1 maps trigger.payload.orderId -> v1OrderId)
+      const v1Draft = {
+        schemaVersion: 1,
+        nodes: [
+          {
+            id: "trig_1",
+            type: "manual_trigger",
+            label: "Order Entry",
+            position: { x: 50, y: 100 },
+            config: { description: "v1 entry" }
+          },
+          {
+            id: "trans_1",
+            type: "data_transform",
+            label: "Map V1",
+            position: { x: 300, y: 100 },
+            config: {
+              mappings: [{ id: "m1", sourcePath: "trigger.payload.orderId", targetKey: "v1OrderId" }]
+            }
+          }
+        ],
+        edges: [
+          { id: "e1", source: "trig_1", sourceHandle: "default", target: "trans_1", targetHandle: "default" }
+        ]
+      };
+
+      await request(app)
+        .patch(`/api/workflows/${wfId}`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({ draftDefinition: v1Draft });
+
+      // 5. Publish v1
+      const pubV1 = await request(app)
+        .post(`/api/workflows/${wfId}/publish`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken);
+      expect(pubV1.status).toBe(201);
+      expect(pubV1.body.version.versionNumber).toBe(1);
+      expect(pubV1.body.alreadyPublished).toBe(false);
+      const v1Id = pubV1.body.version.id;
+
+      // Re-publishing identical draft returns existing v1 idempotently (200 alreadyPublished: true)
+      const pubV1Dup = await request(app)
+        .post(`/api/workflows/${wfId}/publish`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken);
+      expect(pubV1Dup.status).toBe(200);
+      expect(pubV1Dup.body.version.id).toBe(v1Id);
+      expect(pubV1Dup.body.alreadyPublished).toBe(true);
+
+      // 6. Queue a run against v1 with an idempotencyKey
+      const runV1Res = await request(app)
+        .post(`/api/workflows/${wfId}/runs`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({
+          triggerPayload: { orderId: "ORD-100" },
+          idempotencyKey: "idem-order-100"
+        });
+      expect(runV1Res.status).toBe(202);
+      const run1Id = runV1Res.body.run.id;
+      expect(runV1Res.body.run.versionNumber).toBe(1);
+      expect(runV1Res.body.run.status).toBe("QUEUED");
+
+      // Re-sending identical idempotencyKey + payload returns existing run (200)
+      const runV1Replay = await request(app)
+        .post(`/api/workflows/${wfId}/runs`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({
+          triggerPayload: { orderId: "ORD-100" },
+          idempotencyKey: "idem-order-100"
+        });
+      expect(runV1Replay.status).toBe(200);
+      expect(runV1Replay.body.run.id).toBe(run1Id);
+      expect(runV1Replay.body.reusedIdempotentRun).toBe(true);
+
+      // Re-using same idempotencyKey with different payload returns 409 IDEMPOTENCY_KEY_CONFLICT
+      const runV1Conflict = await request(app)
+        .post(`/api/workflows/${wfId}/runs`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({
+          triggerPayload: { orderId: "DIFFERENT-ORDER" },
+          idempotencyKey: "idem-order-100"
+        });
+      expect(runV1Conflict.status).toBe(409);
+      expect(runV1Conflict.body.error.code).toBe("IDEMPOTENCY_KEY_CONFLICT");
+
+      // 7. Mutate draft to v2 AND publish v2 BEFORE worker processes run1!
+      const v2Draft = {
+        ...v1Draft,
+        nodes: [
+          v1Draft.nodes[0]!,
+          {
+            id: "trans_1",
+            type: "data_transform",
+            label: "Map V2",
+            position: { x: 300, y: 100 },
+            config: {
+              mappings: [{ id: "m1", sourcePath: "trigger.payload.orderId", targetKey: "v2ChangedKey" }]
+            }
+          }
+        ]
+      };
+      await request(app)
+        .patch(`/api/workflows/${wfId}`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({ draftDefinition: v2Draft });
+
+      const pubV2 = await request(app)
+        .post(`/api/workflows/${wfId}/publish`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken);
+      expect(pubV2.status).toBe(201);
+      expect(pubV2.body.version.versionNumber).toBe(2);
+
+      // 8. Now dispatch outbox and execute run1 via Worker: run1 MUST execute pinned v1 (`v1OrderId`), NOT v2!
+      const queuedJobs: QueueJobPayload[] = [];
+      const dispatcher = new OutboxDispatcher(
+        executionRepo,
+        {
+          enqueueRunJob: async (job) => {
+            queuedJobs.push(job);
+          }
+        },
+        { dispatcherId: "disp_1" }
+      );
+
+      const batch = await dispatcher.dispatchBatch();
+      expect(batch.claimed).toBe(1);
+      expect(batch.delivered).toBe(1);
+      expect(queuedJobs).toHaveLength(1);
+      expect(queuedJobs[0]!.jobId).toBe(`run:${run1Id}`);
+
+      const workerProcessor = new WorkflowRunProcessor(executionRepo, {
+        workerId: "worker_alpha"
+      });
+      const procResult = await workerProcessor.processRun(run1Id);
+      expect(procResult.processed).toBe(true);
+      expect(procResult.status).toBe("COMPLETED");
+
+      // 9. Inspect run1 via GET /api/runs/:id and verify pinned v1 output (`v1OrderId: "ORD-100"`)
+      const getRunRes = await request(app)
+        .get(`/api/runs/${run1Id}`)
+        .set("Cookie", userA.cookieHeader);
+      expect(getRunRes.status).toBe(200);
+      expect(getRunRes.body.run.status).toBe("COMPLETED");
+      expect(getRunRes.body.run.versionNumber).toBe(1);
+
+      const transNodeExec = getRunRes.body.run.nodeExecutions.find(
+        (n: { nodeId: string }) => n.nodeId === "trans_1"
+      );
+      expect(transNodeExec.status).toBe("COMPLETED");
+      expect(transNodeExec.output).toEqual({ v1OrderId: "ORD-100" });
+
+      // 10. Cross-user authorization check: User B gets 404 on versions, runs, node details, and cancel
+      expect(
+        (await request(app).get(`/api/workflows/${wfId}/versions`).set("Cookie", userB.cookieHeader)).status
+      ).toBe(404);
+      expect(
+        (await request(app).get(`/api/workflows/${wfId}/runs`).set("Cookie", userB.cookieHeader)).status
+      ).toBe(404);
+      expect(
+        (await request(app).get(`/api/runs/${run1Id}`).set("Cookie", userB.cookieHeader)).status
+      ).toBe(404);
+      expect(
+        (await request(app).get(`/api/runs/${run1Id}/nodes`).set("Cookie", userB.cookieHeader)).status
+      ).toBe(404);
+      expect(
+        (
+          await request(app)
+            .post(`/api/runs/${run1Id}/cancel`)
+            .set("Cookie", userB.cookieHeader)
+            .set(CSRF_HEADER_NAME, userB.csrfToken)
+        ).status
+      ).toBe(404);
+    });
+
+    it("handles outbox publication failures, crash recovery, poison dead-lettering, and stale worker lease fencing", async () => {
+      const userA = await registerAndGetAuth("resilience@example.com");
+
+      const createRes = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({
+          name: "Resilience Flow",
+          draftDefinition: {
+            schemaVersion: 1,
+            nodes: [
+              { id: "trig", type: "manual_trigger", label: "Start", position: { x: 0, y: 0 }, config: { description: "" } },
+              {
+                id: "trans",
+                type: "data_transform",
+                label: "Transform",
+                position: { x: 200, y: 0 },
+                config: { mappings: [{ id: "m1", sourcePath: "trigger.payload.val", targetKey: "out" }] }
+              }
+            ],
+            edges: [{ id: "e1", source: "trig", sourceHandle: "default", target: "trans", targetHandle: "default" }]
+          }
+        });
+      const wfId = createRes.body.workflow.id;
+
+      await request(app)
+        .post(`/api/workflows/${wfId}/publish`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken);
+
+      const runRes = await request(app)
+        .post(`/api/workflows/${wfId}/runs`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({ triggerPayload: { val: "ok" } });
+      const runId = runRes.body.run.id;
+
+      // 1. Outbox publication fails 5 times -> transitions to DEAD_LETTER
+      let currentClock = new Date("2026-10-21T18:00:00.000Z");
+      const failingDispatcher = new OutboxDispatcher(
+        executionRepo,
+        {
+          enqueueRunJob: async () => {
+            throw new Error("Redis connection refused");
+          }
+        },
+        {
+          dispatcherId: "disp_fail",
+          baseRetryDelayMs: 100,
+          now: () => currentClock
+        }
+      );
+
+      for (let i = 0; i < 5; i++) {
+        const res = await failingDispatcher.dispatchBatch();
+        expect(res.claimed).toBe(1);
+        expect(res.failed).toBe(1);
+        currentClock = new Date(currentClock.getTime() + 120_000);
+      }
+
+      // 6th attempt: event is now DEAD_LETTER and not retried forever
+      const afterExhaustion = await failingDispatcher.dispatchBatch();
+      expect(afterExhaustion.claimed).toBe(0);
+      const metrics = await executionRepo.getOutboxMetrics();
+      expect(metrics.deadLetterCount).toBe(1);
+
+      // 2. Stale Worker Lease Fencing:
+      // Worker 1 claims runId at T=0 with a 10s lease
+      const t0 = new Date("2026-10-21T19:00:00.000Z");
+      const claim1 = await executionRepo.claimRunForExecution({
+        runId,
+        workerId: "worker_stale_1",
+        leaseDurationMs: 10_000,
+        now: t0
+      });
+      expect(claim1).not.toBeNull();
+      expect(claim1!.attemptNumber).toBe(1);
+
+      // While Worker 1's lease is active (T + 2s), Worker 2 cannot claim the same run
+      const prematureClaim2 = await executionRepo.claimRunForExecution({
+        runId,
+        workerId: "worker_fresh_2",
+        leaseDurationMs: 10_000,
+        now: new Date(t0.getTime() + 2_000)
+      });
+      expect(prematureClaim2).toBeNull();
+
+      // After Worker 1's lease expires (T + 15s), Worker 2 claims the run on attemptNumber = 2
+      const claim2 = await executionRepo.claimRunForExecution({
+        runId,
+        workerId: "worker_fresh_2",
+        leaseDurationMs: 10_000,
+        now: new Date(t0.getTime() + 15_000)
+      });
+      expect(claim2).not.toBeNull();
+      expect(claim2!.attemptNumber).toBe(2);
+
+      // Stale Worker 1 wakes up and tries to mark the run FAILED on attemptNumber = 1 -> fenced out (returns null)!
+      const staleComplete = await executionRepo.completeRunExecution({
+        runId,
+        workerId: "worker_stale_1",
+        attemptNumber: 1,
+        status: "FAILED",
+        completedAt: new Date(t0.getTime() + 16_000),
+        durationMs: 16_000,
+        error: { code: "STALE_ERROR", message: "Should be rejected" },
+        nodeResults: []
+      });
+      expect(staleComplete).toBeNull();
+
+      // Fresh Worker 2 completes attemptNumber = 2 -> succeeds!
+      const freshComplete = await executionRepo.completeRunExecution({
+        runId,
+        workerId: "worker_fresh_2",
+        attemptNumber: 2,
+        status: "COMPLETED",
+        completedAt: new Date(t0.getTime() + 17_000),
+        durationMs: 2_000,
+        nodeResults: []
+      });
+      expect(freshComplete).not.toBeNull();
+      expect(freshComplete!.status).toBe("COMPLETED");
+      expect(freshComplete!.attemptCount).toBe(2);
     });
   });
 });
