@@ -1,7 +1,16 @@
 /**
  * @flowforge/workflow-engine
- * Milestone 1 Skeleton.
- * Graph normalization, DAG validation, and execution orchestration belong to Milestone 3.
+ * Milestone 3: Authoritative Graph Validation & Deterministic Workflow Execution Engine.
  */
 
-export const ENGINE_VERSION = "0.1.0" as const;
+export const ENGINE_VERSION = "0.3.0" as const;
+
+export * from "./types.js";
+export * from "./data-flow.js";
+export * from "./handlers.js";
+export * from "./executor.js";
+export {
+  validateWorkflowExecutionReadiness,
+  type ValidatedExecutableGraph,
+  type ExecutionValidationError
+} from "@flowforge/contracts";

@@ -580,6 +580,63 @@ describe("@flowforge/api — Authentication, Session Revocation, Security & Work
         .set("Cookie", userA.cookieHeader);
       expect(badUuid.status).toBe(400);
       expect(badUuid.body.error.code).toBe("VALIDATION_ERROR");
+
+      // Invalid graph structure: unsupported node type
+      const badNodeType = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({
+          name: "Invalid Node Type Flow",
+          draftDefinition: {
+            schemaVersion: 1,
+            nodes: [{ id: "n1", type: "unsupported_script_node" }],
+            edges: []
+          }
+        });
+      expect(badNodeType.status).toBe(400);
+      expect(badNodeType.body.error.code).toBe("VALIDATION_ERROR");
+
+      // Invalid graph structure: directed cycle
+      const cyclicGraph = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({
+          name: "Cyclic Flow",
+          draftDefinition: {
+            schemaVersion: 1,
+            nodes: [
+              { id: "n1", type: "http_request" },
+              { id: "n2", type: "data_transform" }
+            ],
+            edges: [
+              { id: "e1", source: "n1", target: "n2" },
+              { id: "e2", source: "n2", target: "n1" }
+            ]
+          }
+        });
+      expect(cyclicGraph.status).toBe(400);
+      expect(cyclicGraph.body.error.code).toBe("VALIDATION_ERROR");
+
+      // Invalid graph structure: condition node without 'true'/'false' sourceHandle
+      const badConditionHandle = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({
+          name: "Bad Condition Handle Flow",
+          draftDefinition: {
+            schemaVersion: 1,
+            nodes: [
+              { id: "c1", type: "condition" },
+              { id: "t1", type: "data_transform" }
+            ],
+            edges: [{ id: "e1", source: "c1", sourceHandle: "default", target: "t1" }]
+          }
+        });
+      expect(badConditionHandle.status).toBe(400);
+      expect(badConditionHandle.body.error.code).toBe("VALIDATION_ERROR");
     });
   });
 });

@@ -9,6 +9,7 @@ import {
   DraftDefinitionSchema,
   validateGraphConnection,
   validateNodeConfigForEditor,
+  validateWorkflowExecutionReadiness,
   normalizeDraftDefinition,
   createDefaultEditorNode,
   removeNodeAndConnectedEdges,
@@ -47,7 +48,7 @@ describe("@flowforge/contracts", () => {
     });
   });
 
-  describe("Workflow & Editor Graph Contracts (Milestone 2)", () => {
+  describe("Workflow & Editor Graph Contracts (Milestones 2 & 3)", () => {
     it("serializes and deserializes all 4 initial node types with positions and configs", () => {
       const nodes = [
         createDefaultEditorNode("manual_trigger", "node_trigger", { x: 80, y: 120 }),
@@ -108,6 +109,7 @@ describe("@flowforge/contracts", () => {
         edges
       });
 
+      expect(roundTripped.isCorrupted).toBe(false);
       expect(roundTripped.warnings).toHaveLength(0);
       expect(roundTripped.nodes).toEqual(nodes);
       expect(roundTripped.edges).toEqual(edges);
@@ -207,7 +209,7 @@ describe("@flowforge/contracts", () => {
       // 7. Cycle (trans -> cond) rejected
       const cycleCheck = validateGraphConnection(
         nodes,
-        edgesWithTrans.filter((e) => e.id !== "e1"), // even if cond had no incoming edge
+        edgesWithTrans.filter((e) => e.id !== "e1"),
         {
           source: "trans",
           sourceHandle: "default",
@@ -217,7 +219,7 @@ describe("@flowforge/contracts", () => {
       expect(cycleCheck.valid).toBe(false);
     });
 
-    it("rejects duplicate node IDs, duplicate edge IDs, and >1 Manual Trigger in DraftDefinitionSchema", () => {
+    it("rejects duplicate node IDs, duplicate edge IDs, unsupported node types, invalid schemaVersion, and >1 Manual Trigger in DraftDefinitionSchema", () => {
       const dupNodeRes = DraftDefinitionSchema.safeParse({
         schemaVersion: 1,
         nodes: [
@@ -237,6 +239,32 @@ describe("@flowforge/contracts", () => {
         edges: []
       });
       expect(twoTriggersRes.success).toBe(false);
+
+      const badTypeRes = DraftDefinitionSchema.safeParse({
+        schemaVersion: 1,
+        nodes: [{ id: "n1", type: "arbitrary_code_eval" }],
+        edges: []
+      });
+      expect(badTypeRes.success).toBe(false);
+
+      const badSchemaVerRes = DraftDefinitionSchema.safeParse({
+        schemaVersion: 2,
+        nodes: [],
+        edges: []
+      });
+      expect(badSchemaVerRes.success).toBe(false);
+
+      const conditionDefaultHandleRes = DraftDefinitionSchema.safeParse({
+        schemaVersion: 1,
+        nodes: [
+          { id: "c1", type: "condition" },
+          { id: "d1", type: "data_transform" }
+        ],
+        edges: [
+          { id: "e1", source: "c1", target: "d1" } // defaults to sourceHandle: "default", which is invalid for condition!
+        ]
+      });
+      expect(conditionDefaultHandleRes.success).toBe(false);
     });
 
     it("allows incomplete drafts (unconfigured fields, disconnected nodes) to be saved via Create/Update schemas", () => {
@@ -258,6 +286,119 @@ describe("@flowforge/contracts", () => {
       const httpNode = createDefaultEditorNode("http_request", "http_unconfigured", { x: 100, y: 100 });
       const fieldErrors = validateNodeConfigForEditor(httpNode);
       expect(fieldErrors.some((e) => e.field === "url")).toBe(true);
+    });
+
+    it("distinguishes draft save validity from execution readiness (validateWorkflowExecutionReadiness)", () => {
+      // 1. Missing trigger is rejected for execution
+      const noTrigger = validateWorkflowExecutionReadiness({
+        schemaVersion: 1,
+        nodes: [
+          {
+            id: "d1",
+            type: "data_transform",
+            label: "Transform",
+            position: { x: 0, y: 0 },
+            config: { mappings: [{ id: "m1", sourcePath: "trigger.payload.id", targetKey: "id" }] }
+          }
+        ],
+        edges: []
+      });
+      expect(noTrigger.ready).toBe(false);
+      if (!noTrigger.ready) {
+        expect(noTrigger.errors.some((e) => e.code === "MISSING_TRIGGER")).toBe(true);
+      }
+
+      // 2. Disconnected node is rejected for execution even though it can be saved as draft
+      const withDisconnected = validateWorkflowExecutionReadiness({
+        schemaVersion: 1,
+        nodes: [
+          createDefaultEditorNode("manual_trigger", "trig", { x: 0, y: 0 }),
+          {
+            id: "orphan",
+            type: "data_transform",
+            label: "Orphan Transform",
+            position: { x: 300, y: 0 },
+            config: { mappings: [] }
+          }
+        ],
+        edges: []
+      });
+      expect(withDisconnected.ready).toBe(false);
+      if (!withDisconnected.ready) {
+        expect(withDisconnected.errors.some((e) => e.code === "DISCONNECTED_NODE")).toBe(true);
+      }
+
+      // 3. Connected graph with incomplete node config (empty condition leftOperand) is rejected for execution
+      const incompleteCond = validateWorkflowExecutionReadiness({
+        schemaVersion: 1,
+        nodes: [
+          createDefaultEditorNode("manual_trigger", "trig", { x: 0, y: 0 }),
+          createDefaultEditorNode("condition", "cond", { x: 200, y: 0 }),
+          createDefaultEditorNode("data_transform", "trans", { x: 400, y: 0 })
+        ],
+        edges: [
+          { id: "e1", source: "trig", sourceHandle: "default", target: "cond", targetHandle: "default" },
+          { id: "e2", source: "cond", sourceHandle: "true", target: "trans", targetHandle: "default" }
+        ]
+      });
+      expect(incompleteCond.ready).toBe(false);
+      if (!incompleteCond.ready) {
+        expect(incompleteCond.errors.some((e) => e.code === "INCOMPLETE_NODE_CONFIG")).toBe(true);
+      }
+
+      // 4. Complete and connected graph passes execution readiness and produces topologicalOrder
+      const readyCheck = validateWorkflowExecutionReadiness({
+        schemaVersion: 1,
+        nodes: [
+          createDefaultEditorNode("manual_trigger", "trig", { x: 0, y: 0 }),
+          {
+            id: "cond",
+            type: "condition",
+            label: "Check Status",
+            position: { x: 200, y: 0 },
+            config: {
+              leftOperand: "trigger.payload.status",
+              operator: "equals",
+              rightOperand: "paid"
+            }
+          },
+          {
+            id: "trans",
+            type: "data_transform",
+            label: "Map Output",
+            position: { x: 400, y: 0 },
+            config: {
+              mappings: [{ id: "m1", sourcePath: "trigger.payload.orderId", targetKey: "id" }]
+            }
+          }
+        ],
+        edges: [
+          { id: "e1", source: "trig", sourceHandle: "default", target: "cond", targetHandle: "default" },
+          { id: "e2", source: "cond", sourceHandle: "true", target: "trans", targetHandle: "default" }
+        ]
+      });
+      expect(readyCheck.ready).toBe(true);
+      if (readyCheck.ready) {
+        expect(readyCheck.graph.topologicalOrder).toEqual(["trig", "cond", "trans"]);
+      }
+    });
+
+    it("flags corrupted stored drafts with isCorrupted: true in normalizeDraftDefinition", () => {
+      const corrupted = normalizeDraftDefinition({
+        schemaVersion: 1,
+        nodes: [
+          createDefaultEditorNode("manual_trigger", "trig_1", { x: 10, y: 10 }),
+          { id: "bad_node", type: "unsupported_magic_node" }
+        ],
+        edges: [
+          { id: "dangling_edge", source: "trig_1", target: "bad_node" }
+        ]
+      });
+
+      expect(corrupted.isCorrupted).toBe(true);
+      expect(corrupted.warnings.length).toBeGreaterThan(0);
+      expect(corrupted.nodes).toHaveLength(1);
+      expect(corrupted.edges).toHaveLength(0);
     });
 
     it("removes connected edges when deleting a node", () => {

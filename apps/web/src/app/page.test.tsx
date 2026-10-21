@@ -344,5 +344,91 @@ describe("@flowforge/web — Dashboard & Visual Workflow Editor Suite", () => {
         screen.getByText("Workflow not found or you do not have access to it.")
       ).toBeInTheDocument();
     });
+
+    it("locks saving when a stored draft contains malformed data until the user clicks Recover & Repair Draft", async () => {
+      vi.spyOn(apiClient, "getMe").mockResolvedValue({
+        user: {
+          id: "00000000-0000-0000-0000-000000000001",
+          email: "dev@flowforge.io",
+          name: "Dev",
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        },
+        csrfToken: "csrf-123"
+      });
+
+      vi.spyOn(apiClient, "getWorkflow").mockResolvedValue({
+        workflow: {
+          id: wfId,
+          userId: "00000000-0000-0000-0000-000000000001",
+          name: "Legacy Corrupted Workflow",
+          description: null,
+          draftDefinition: {
+            schemaVersion: 1,
+            nodes: [
+              {
+                id: "trig_1",
+                type: "manual_trigger",
+                label: "Manual Trigger",
+                position: { x: 100, y: 100 },
+                config: { description: "" }
+              },
+              {
+                id: "corrupt_node_99",
+                type: "unknown_future_node_type"
+              }
+            ],
+            edges: []
+          },
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString()
+        }
+      });
+
+      const updateSpy = vi
+        .spyOn(apiClient, "updateWorkflow")
+        .mockImplementation(async (_id, payload) => ({
+          workflow: {
+            id: wfId,
+            userId: "00000000-0000-0000-0000-000000000001",
+            name: payload.name ?? "Legacy Corrupted Workflow",
+            description: null,
+            draftDefinition: payload.draftDefinition,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString()
+          }
+        }));
+
+      render(<WorkflowEditor workflowId={wfId} />);
+
+      expect(
+        await screen.findByDisplayValue("Legacy Corrupted Workflow")
+      ).toBeInTheDocument();
+
+      // Corrupted Draft Protection banner is shown and Save is locked
+      expect(
+        screen.getByText(/Corrupted Draft Protection:/i)
+      ).toBeInTheDocument();
+      const saveLockedBtn = screen.getByRole("button", { name: /Save Locked/i });
+      expect(saveLockedBtn).toBeDisabled();
+
+      // Clicking Recover & Repair Draft unlocks saving and marks draft as unsaved
+      fireEvent.click(
+        screen.getByRole("button", { name: /Recover & Repair Draft/i })
+      );
+
+      expect(screen.getByTestId("save-status-indicator")).toHaveTextContent(
+        "Unsaved changes"
+      );
+      const saveDraftBtn = screen.getByRole("button", { name: /Save Draft/i });
+      expect(saveDraftBtn).not.toBeDisabled();
+
+      // Now explicit save succeeds with the repaired graph
+      fireEvent.click(saveDraftBtn);
+      await waitFor(() => {
+        expect(updateSpy).toHaveBeenCalledTimes(1);
+        expect(screen.getByTestId("save-status-indicator")).toHaveTextContent("Saved");
+      });
+    });
   });
 });

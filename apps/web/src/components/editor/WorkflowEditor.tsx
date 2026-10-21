@@ -67,6 +67,7 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
   const [saveError, setSaveError] = useState<string | null>(null);
   const [connectionFeedback, setConnectionFeedback] = useState<string | null>(null);
   const [normalizationWarnings, setNormalizationWarnings] = useState<string[]>([]);
+  const [isCorruptedDraftLocked, setIsCorruptedDraftLocked] = useState(false);
 
   // Monotonically increasing revision counter to prevent stale saves from clobbering newer edits
   const editRevisionRef = useRef(0);
@@ -98,6 +99,7 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
       setEditorNodes(normalized.nodes);
       setEditorEdges(normalized.edges);
       setNormalizationWarnings(normalized.warnings);
+      setIsCorruptedDraftLocked(normalized.isCorrupted);
       setSelectedNodeId(null);
       setSelectedEdgeId(null);
       editRevisionRef.current = 0;
@@ -308,6 +310,14 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
 
   // Explicit Save Handler with Revision Tracking & Duplicate Request Prevention
   const handleSave = useCallback(async () => {
+    if (isCorruptedDraftLocked) {
+      setSaveStatus("error");
+      setSaveError(
+        "Saving is locked because the stored draft contained malformed data. Click 'Recover & Repair Draft' to confirm replacing the corrupted elements before saving."
+      );
+      return;
+    }
+
     if (inFlightSavePromiseRef.current) {
       return inFlightSavePromiseRef.current;
     }
@@ -324,7 +334,7 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
       name: trimmedName,
       description: workflowDescription,
       draftDefinition: {
-        schemaVersion: 1,
+        schemaVersion: 1 as const,
         nodes: editorNodes,
         edges: editorEdges
       }
@@ -356,7 +366,20 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
 
     inFlightSavePromiseRef.current = savePromise;
     return savePromise;
-  }, [workflowId, workflowName, workflowDescription, editorNodes, editorEdges]);
+  }, [
+    isCorruptedDraftLocked,
+    workflowId,
+    workflowName,
+    workflowDescription,
+    editorNodes,
+    editorEdges
+  ]);
+
+  const handleRecoverCorruptedDraft = useCallback(() => {
+    setIsCorruptedDraftLocked(false);
+    setNormalizationWarnings([]);
+    markDirty();
+  }, [markDirty]);
 
   // Convert EditorNodes / EditorEdges to React Flow format
   const rfNodes: Node<FlowForgeNodeData>[] = useMemo(
@@ -606,25 +629,43 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
           <button
             type="button"
             onClick={() => void handleSave()}
-            disabled={saveStatus === "saving"}
+            disabled={saveStatus === "saving" || isCorruptedDraftLocked}
+            title={
+              isCorruptedDraftLocked
+                ? "Stored draft contains malformed data. Click 'Recover & Repair Draft' in the warning banner before saving."
+                : undefined
+            }
             style={{
               padding: "0.45rem 1rem",
-              backgroundColor: "var(--ff-accent)",
-              color: "#090d16",
+              backgroundColor: isCorruptedDraftLocked
+                ? "var(--ff-bg-elevated)"
+                : "var(--ff-accent)",
+              color: isCorruptedDraftLocked ? "var(--ff-text-muted)" : "#090d16",
               fontWeight: 700,
-              border: "none",
+              border: isCorruptedDraftLocked
+                ? "1px solid var(--ff-border-subtle)"
+                : "none",
               borderRadius: "6px",
               fontSize: "0.85rem",
-              cursor: saveStatus === "saving" ? "wait" : "pointer"
+              cursor:
+                saveStatus === "saving"
+                  ? "wait"
+                  : isCorruptedDraftLocked
+                    ? "not-allowed"
+                    : "pointer"
             }}
           >
-            {saveStatus === "saving" ? "Saving..." : "Save Draft"}
+            {saveStatus === "saving"
+              ? "Saving..."
+              : isCorruptedDraftLocked
+                ? "Save Locked"
+                : "Save Draft"}
           </button>
 
           <button
             type="button"
             disabled
-            title="Workflow execution engine is scheduled for Milestone 3/4 and is not available in Milestone 2."
+            title="Workflow execution UI is scheduled for Milestone 4 (Asynchronous Queue & Execution History)."
             aria-label="Run Workflow (Execution not implemented yet)"
             style={{
               padding: "0.45rem 0.9rem",
@@ -637,15 +678,19 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
               cursor: "not-allowed"
             }}
           >
-            Run (Milestone 3)
+            Run (Milestone 4)
           </button>
         </div>
       </header>
 
-      {/* Banner for Save Errors, Connection Validation Feedback, or Legacy Normalization Warnings */}
-      {(saveError || connectionFeedback || normalizationWarnings.length > 0) && (
+      {/* Banner for Save Errors, Connection Validation Feedback, or Corrupted/Legacy Draft Protection */}
+      {(saveError ||
+        connectionFeedback ||
+        normalizationWarnings.length > 0 ||
+        isCorruptedDraftLocked) && (
         <div
           role="alert"
+          data-testid="editor-alert-banner"
           style={{
             backgroundColor: saveError
               ? "rgba(239, 68, 68, 0.15)"
@@ -658,34 +703,64 @@ export function WorkflowEditor({ workflowId }: { workflowId: string }) {
             color: saveError ? "#fca5a5" : "#fde68a",
             display: "flex",
             justifyContent: "space-between",
-            alignItems: "center"
+            alignItems: "center",
+            gap: "1rem"
           }}
         >
           <div>
             {saveError && <strong>Save Error: {saveError} </strong>}
             {connectionFeedback && <span>{connectionFeedback} </span>}
+            {isCorruptedDraftLocked && (
+              <strong>
+                Corrupted Draft Protection: Stored workflow data contained malformed
+                elements that were quarantined. Saving is locked to prevent silent
+                overwrite.{" "}
+              </strong>
+            )}
             {normalizationWarnings.length > 0 && (
               <span>{normalizationWarnings.join(" ")}</span>
             )}
           </div>
-          <button
-            type="button"
-            onClick={() => {
-              setSaveError(null);
-              setConnectionFeedback(null);
-              setNormalizationWarnings([]);
-            }}
-            style={{
-              background: "none",
-              border: "none",
-              color: "inherit",
-              cursor: "pointer",
-              fontSize: "0.75rem",
-              textDecoration: "underline"
-            }}
-          >
-            Dismiss
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: "0.6rem", flexShrink: 0 }}>
+            {isCorruptedDraftLocked && (
+              <button
+                type="button"
+                onClick={handleRecoverCorruptedDraft}
+                style={{
+                  padding: "0.3rem 0.65rem",
+                  backgroundColor: "#fbbf24",
+                  color: "#090d16",
+                  fontWeight: 700,
+                  border: "none",
+                  borderRadius: "5px",
+                  fontSize: "0.75rem",
+                  cursor: "pointer"
+                }}
+              >
+                Recover & Repair Draft
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => {
+                setSaveError(null);
+                setConnectionFeedback(null);
+                if (!isCorruptedDraftLocked) {
+                  setNormalizationWarnings([]);
+                }
+              }}
+              style={{
+                background: "none",
+                border: "none",
+                color: "inherit",
+                cursor: "pointer",
+                fontSize: "0.75rem",
+                textDecoration: "underline"
+              }}
+            >
+              Dismiss
+            </button>
+          </div>
         </div>
       )}
 
