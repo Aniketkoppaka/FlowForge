@@ -4,7 +4,11 @@ import {
   CreateWorkflowRequestSchema,
   UpdateWorkflowRequestSchema
 } from "@flowforge/contracts";
-import type { WorkflowRepository, WorkflowRecord } from "../repositories/types.js";
+import type {
+  WorkflowRepository,
+  SessionRepository,
+  WorkflowRecord
+} from "../repositories/types.js";
 import type { AppConfig } from "../config.js";
 import { createAuthMiddleware } from "../middleware/auth.js";
 
@@ -24,10 +28,11 @@ function serializeWorkflow(wf: WorkflowRecord) {
 
 export function createWorkflowRouter(
   workflowRepo: WorkflowRepository,
+  sessionRepo: SessionRepository,
   config: AppConfig
 ): Router {
   const router = Router();
-  const requireAuth = createAuthMiddleware(config);
+  const requireAuth = createAuthMiddleware(config, sessionRepo);
 
   router.use(requireAuth);
 

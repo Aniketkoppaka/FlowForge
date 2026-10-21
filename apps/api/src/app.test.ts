@@ -1,15 +1,18 @@
 import { describe, it, expect, beforeEach } from "vitest";
 import request from "supertest";
+import { SignJWT } from "jose";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import {
   InMemoryUserRepository,
+  InMemorySessionRepository,
   InMemoryWorkflowRepository
 } from "./repositories/memory-repositories.js";
 import {
   SESSION_COOKIE_NAME,
   CSRF_COOKIE_NAME,
-  CSRF_HEADER_NAME
+  CSRF_HEADER_NAME,
+  createSessionToken
 } from "./security/session.js";
 
 function extractCookies(setCookieHeader: string[] | string | undefined): {
@@ -42,9 +45,10 @@ function extractCookies(setCookieHeader: string[] | string | undefined): {
   };
 }
 
-describe("@flowforge/api — Authentication & Workflow CRUD Suite", () => {
+describe("@flowforge/api — Authentication, Session Revocation, Security & Workflow CRUD Suite", () => {
   let app: ReturnType<typeof createApp>;
   let userRepo: InMemoryUserRepository;
+  let sessionRepo: InMemorySessionRepository;
   let workflowRepo: InMemoryWorkflowRepository;
 
   const testConfig = loadConfig({
@@ -57,12 +61,13 @@ describe("@flowforge/api — Authentication & Workflow CRUD Suite", () => {
 
   beforeEach(() => {
     userRepo = new InMemoryUserRepository();
+    sessionRepo = new InMemorySessionRepository();
     workflowRepo = new InMemoryWorkflowRepository();
-    app = createApp({ config: testConfig, userRepo, workflowRepo });
+    app = createApp({ config: testConfig, userRepo, sessionRepo, workflowRepo });
   });
 
-  describe("1. Authentication Lifecycle", () => {
-    it("registers a new user, sets HttpOnly session + CSRF cookies, and returns user info", async () => {
+  describe("1. Authentication & Server-Side Session Revocation Lifecycle", () => {
+    it("registers a new user, persists a server-side session, sets HttpOnly session + CSRF cookies, and returns user info", async () => {
       const res = await request(app).post("/api/auth/register").send({
         email: "Alice@Example.com",
         password: "StrongPassword123!",
@@ -79,8 +84,23 @@ describe("@flowforge/api — Authentication & Workflow CRUD Suite", () => {
 
       const cookies = res.headers["set-cookie"] as unknown as string[];
       expect(cookies).toBeDefined();
-      expect(cookies.some((c) => c.startsWith(`${SESSION_COOKIE_NAME}=`) && c.includes("HttpOnly"))).toBe(true);
-      expect(cookies.some((c) => c.startsWith(`${CSRF_COOKIE_NAME}=`))).toBe(true);
+      expect(
+        cookies.some(
+          (c) =>
+            c.startsWith(`${SESSION_COOKIE_NAME}=`) &&
+            c.includes("HttpOnly") &&
+            c.includes("SameSite=Lax") &&
+            c.includes("Path=/")
+        )
+      ).toBe(true);
+      expect(
+        cookies.some(
+          (c) =>
+            c.startsWith(`${CSRF_COOKIE_NAME}=`) &&
+            c.includes("SameSite=Lax") &&
+            c.includes("Path=/")
+        )
+      ).toBe(true);
     });
 
     it("rejects duplicate account registration with 409 Conflict", async () => {
@@ -131,43 +151,109 @@ describe("@flowforge/api — Authentication & Workflow CRUD Suite", () => {
       expect(okRes.body.user.email).toBe("carol@example.com");
     });
 
-    it("supports /api/auth/me and clears cookies on /api/auth/logout", async () => {
+    it("revokes the server-side session on /api/auth/logout and rejects any replay of the old session cookie", async () => {
       const regRes = await request(app).post("/api/auth/register").send({
         email: "dave@example.com",
         password: "StrongPassword123!"
       });
 
-      const { cookieHeader, csrfToken } = extractCookies(regRes.headers["set-cookie"]);
+      // Capture the original session & CSRF cookies before logout
+      const { cookieHeader: capturedPreLogoutCookie, csrfToken: capturedCsrfToken } =
+        extractCookies(regRes.headers["set-cookie"]);
 
-      // GET /api/auth/me
+      // Verify session works before logout
       const meRes = await request(app)
         .get("/api/auth/me")
-        .set("Cookie", cookieHeader);
+        .set("Cookie", capturedPreLogoutCookie);
       expect(meRes.status).toBe(200);
       expect(meRes.body.user.email).toBe("dave@example.com");
 
       // POST /api/auth/logout without CSRF token -> rejected with 403
       const logoutNoCsrf = await request(app)
         .post("/api/auth/logout")
-        .set("Cookie", cookieHeader);
+        .set("Cookie", capturedPreLogoutCookie);
       expect(logoutNoCsrf.status).toBe(403);
       expect(logoutNoCsrf.body.error.code).toBe("CSRF_INVALID");
 
-      // POST /api/auth/logout with valid CSRF token -> 200
+      // POST /api/auth/logout with valid CSRF token -> 200 & revokes session server-side
       const logoutOk = await request(app)
         .post("/api/auth/logout")
-        .set("Cookie", cookieHeader)
-        .set(CSRF_HEADER_NAME, csrfToken);
+        .set("Cookie", capturedPreLogoutCookie)
+        .set(CSRF_HEADER_NAME, capturedCsrfToken);
       expect(logoutOk.status).toBe(200);
       expect(logoutOk.body.ok).toBe(true);
 
-      // Unauthenticated /api/auth/me -> 401
-      const unauthMe = await request(app).get("/api/auth/me");
-      expect(unauthMe.status).toBe(401);
+      // CRITICAL REGRESSION TEST: Replay the captured pre-logout cookie against protected endpoints
+      const replayMe = await request(app)
+        .get("/api/auth/me")
+        .set("Cookie", capturedPreLogoutCookie);
+      expect(replayMe.status).toBe(401);
+      expect(replayMe.body.error.code).toBe("UNAUTHORIZED");
+
+      const replayListWorkflows = await request(app)
+        .get("/api/workflows")
+        .set("Cookie", capturedPreLogoutCookie);
+      expect(replayListWorkflows.status).toBe(401);
+
+      const replayCreateWorkflow = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", capturedPreLogoutCookie)
+        .set(CSRF_HEADER_NAME, capturedCsrfToken)
+        .send({ name: "Should Fail After Logout" });
+      expect(replayCreateWorkflow.status).toBe(401);
+
+      const replayLogoutAgain = await request(app)
+        .post("/api/auth/logout")
+        .set("Cookie", capturedPreLogoutCookie)
+        .set(CSRF_HEADER_NAME, capturedCsrfToken);
+      expect(replayLogoutAgain.status).toBe(401);
+    });
+
+    it("rejects forged, expired, or unpersisted JWTs and alg=none tokens", async () => {
+      // 1. Validly signed JWT whose jti does not exist in SessionRepository
+      const { token: unpersistedToken } = await createSessionToken(
+        { userId: "00000000-0000-0000-0000-000000000001", email: "ghost@example.com" },
+        testConfig.SESSION_SECRET
+      );
+      const resUnpersisted = await request(app)
+        .get("/api/auth/me")
+        .set("Cookie", `${SESSION_COOKIE_NAME}=${unpersistedToken}`);
+      expect(resUnpersisted.status).toBe(401);
+
+      // 2. Expired JWT
+      const { token: expiredToken, jti: expJti } = await createSessionToken(
+        { userId: "00000000-0000-0000-0000-000000000001", email: "exp@example.com" },
+        testConfig.SESSION_SECRET,
+        -60 // expired 60s ago
+      );
+      await sessionRepo.create({
+        jti: expJti,
+        userId: "00000000-0000-0000-0000-000000000001",
+        expiresAt: new Date(Date.now() - 60000)
+      });
+      const resExpired = await request(app)
+        .get("/api/auth/me")
+        .set("Cookie", `${SESSION_COOKIE_NAME}=${expiredToken}`);
+      expect(resExpired.status).toBe(401);
+
+      // 3. JWT signed with wrong secret
+      const wrongKey = new TextEncoder().encode("wrong-secret-key-that-is-at-least-32-bytes-long");
+      const badSigToken = await new SignJWT({ email: "attacker@example.com" })
+        .setProtectedHeader({ alg: "HS256" })
+        .setSubject("00000000-0000-0000-0000-000000000001")
+        .setJti("fake-jti")
+        .setIssuer("flowforge:api")
+        .setAudience("flowforge:client")
+        .setExpirationTime("2h")
+        .sign(wrongKey);
+
+      const resBadSig = await request(app)
+        .get("/api/auth/me")
+        .set("Cookie", `${SESSION_COOKIE_NAME}=${badSigToken}`);
+      expect(resBadSig.status).toBe(401);
     });
 
     it("enforces login rate limiting", async () => {
-      // In test mode, limit is 10 requests per window
       for (let i = 0; i < 10; i++) {
         await request(app).post("/api/auth/login").send({
           email: "ratelimit@example.com",
@@ -184,7 +270,124 @@ describe("@flowforge/api — Authentication & Workflow CRUD Suite", () => {
     });
   });
 
-  describe("2. Workflow CRUD, Draft Storage, Soft Deletion & Tenant Isolation", () => {
+  describe("2. CSRF, CORS, and Production Secret Validation", () => {
+    it("enforces CSRF protection across all state-changing workflow routes and rejects cross-session CSRF tokens", async () => {
+      const regA = await request(app).post("/api/auth/register").send({
+        email: "csrfa@example.com",
+        password: "Password123456!"
+      });
+      const regB = await request(app).post("/api/auth/register").send({
+        email: "csrfb@example.com",
+        password: "Password123456!"
+      });
+
+      const authA = extractCookies(regA.headers["set-cookie"]);
+      const authB = extractCookies(regB.headers["set-cookie"]);
+
+      // Create workflow with User A's valid CSRF
+      const createOk = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", authA.cookieHeader)
+        .set(CSRF_HEADER_NAME, authA.csrfToken)
+        .send({ name: "CSRF Test Flow" });
+      expect(createOk.status).toBe(201);
+      const wfId = createOk.body.workflow.id;
+
+      // Missing CSRF header on POST, PATCH, DELETE -> 403
+      expect(
+        (
+          await request(app)
+            .post("/api/workflows")
+            .set("Cookie", authA.cookieHeader)
+            .send({ name: "No CSRF" })
+        ).status
+      ).toBe(403);
+
+      expect(
+        (
+          await request(app)
+            .patch(`/api/workflows/${wfId}`)
+            .set("Cookie", authA.cookieHeader)
+            .send({ name: "No CSRF" })
+        ).status
+      ).toBe(403);
+
+      expect(
+        (
+          await request(app)
+            .delete(`/api/workflows/${wfId}`)
+            .set("Cookie", authA.cookieHeader)
+        ).status
+      ).toBe(403);
+
+      // Using User B's valid CSRF token with User A's session cookie -> 403
+      const crossSessionCsrf = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", `${SESSION_COOKIE_NAME}=${authA.cookieHeader.split(";")[0]?.split("=")[1]}; ${CSRF_COOKIE_NAME}=${authB.csrfToken}`)
+        .set(CSRF_HEADER_NAME, authB.csrfToken)
+        .send({ name: "Cross Session CSRF" });
+      expect(crossSessionCsrf.status).toBe(403);
+    });
+
+    it("enforces explicit CORS origin allowlist and never reflects untrusted origins", async () => {
+      // Trusted origin receives Access-Control-Allow-Origin
+      const trustedRes = await request(app)
+        .get("/api/health")
+        .set("Origin", "http://localhost:3000");
+      expect(trustedRes.status).toBe(200);
+      expect(trustedRes.headers["access-control-allow-origin"]).toBe("http://localhost:3000");
+      expect(trustedRes.headers["access-control-allow-credentials"]).toBe("true");
+
+      // Untrusted origin does NOT receive Access-Control-Allow-Origin
+      const untrustedRes = await request(app)
+        .get("/api/health")
+        .set("Origin", "https://evil-attacker.example.com");
+      expect(untrustedRes.status).toBe(200);
+      expect(untrustedRes.headers["access-control-allow-origin"]).toBeUndefined();
+    });
+
+    it("fails fast in production if SESSION_SECRET or CSRF_SECRET is missing or too short, or if CORS_ORIGIN is wildcard", () => {
+      expect(() =>
+        loadConfig({
+          NODE_ENV: "production"
+        })
+      ).toThrow(/Invalid environment configuration/);
+
+      expect(() =>
+        loadConfig({
+          NODE_ENV: "production",
+          SESSION_SECRET: "short",
+          CSRF_SECRET: "short"
+        })
+      ).toThrow(/Invalid environment configuration/);
+
+      expect(() =>
+        loadConfig({
+          NODE_ENV: "production",
+          SESSION_SECRET: "prod-session-secret-at-least-32-chars-long-1234",
+          CSRF_SECRET: "prod-csrf-secret-at-least-32-chars-long-1234567",
+          CORS_ORIGIN: "*"
+        })
+      ).toThrow(/Invalid environment configuration/);
+    });
+
+    it("handles malformed JSON payloads cleanly without leaking stack traces", async () => {
+      const res = await request(app)
+        .post("/api/auth/login")
+        .set("Content-Type", "application/json")
+        .send("{malformed-json:");
+
+      expect(res.status).toBe(400);
+      expect(res.body).toEqual({
+        error: {
+          code: "INVALID_JSON",
+          message: "Malformed JSON payload"
+        }
+      });
+    });
+  });
+
+  describe("3. Workflow CRUD, Draft Storage, Soft Deletion & Tenant Isolation", () => {
     async function registerAndGetAuth(email: string) {
       const res = await request(app).post("/api/auth/register").send({
         email,

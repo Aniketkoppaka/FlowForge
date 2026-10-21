@@ -7,6 +7,15 @@ export interface UserRecord {
   updatedAt: Date;
 }
 
+export interface SessionRecord {
+  id: string;
+  jti: string;
+  userId: string;
+  expiresAt: Date;
+  revokedAt: Date | null;
+  createdAt: Date;
+}
+
 export interface WorkflowRecord {
   id: string;
   userId: string;
@@ -22,6 +31,12 @@ export interface UserRepository {
   findByEmail(email: string): Promise<UserRecord | null>;
   findById(id: string): Promise<UserRecord | null>;
   create(data: { email: string; name?: string | null; passwordHash: string }): Promise<UserRecord>;
+}
+
+export interface SessionRepository {
+  create(data: { jti: string; userId: string; expiresAt: Date }): Promise<SessionRecord>;
+  findActiveByJti(jti: string, now?: Date): Promise<SessionRecord | null>;
+  revokeByJti(jti: string): Promise<boolean>;
 }
 
 export interface WorkflowRepository {

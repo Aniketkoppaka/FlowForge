@@ -1,5 +1,12 @@
 import { prisma, Prisma } from "@flowforge/database";
-import type { UserRepository, WorkflowRepository, UserRecord, WorkflowRecord } from "./types.js";
+import type {
+  UserRepository,
+  SessionRepository,
+  WorkflowRepository,
+  UserRecord,
+  SessionRecord,
+  WorkflowRecord
+} from "./types.js";
 
 export class PrismaUserRepository implements UserRepository {
   async findByEmail(email: string): Promise<UserRecord | null> {
@@ -26,6 +33,48 @@ export class PrismaUserRepository implements UserRepository {
         passwordHash: data.passwordHash
       }
     });
+  }
+}
+
+export class PrismaSessionRepository implements SessionRepository {
+  async create(data: {
+    jti: string;
+    userId: string;
+    expiresAt: Date;
+  }): Promise<SessionRecord> {
+    return prisma.session.create({
+      data: {
+        jti: data.jti,
+        userId: data.userId,
+        expiresAt: data.expiresAt
+      }
+    });
+  }
+
+  async findActiveByJti(jti: string, now: Date = new Date()): Promise<SessionRecord | null> {
+    return prisma.session.findFirst({
+      where: {
+        jti,
+        revokedAt: null,
+        expiresAt: {
+          gt: now
+        }
+      }
+    });
+  }
+
+  async revokeByJti(jti: string): Promise<boolean> {
+    const result = await prisma.session.updateMany({
+      where: {
+        jti,
+        revokedAt: null
+      },
+      data: {
+        revokedAt: new Date()
+      }
+    });
+
+    return result.count > 0;
   }
 }
 

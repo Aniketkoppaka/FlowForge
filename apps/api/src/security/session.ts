@@ -4,6 +4,7 @@ import { randomBytes, createHmac, timingSafeEqual } from "node:crypto";
 export const SESSION_COOKIE_NAME = "ff_session";
 export const CSRF_COOKIE_NAME = "ff_csrf";
 export const CSRF_HEADER_NAME = "x-csrf-token";
+export const SESSION_TTL_SECONDS = 60 * 60 * 8; // 8 hours
 
 export interface SessionPayload {
   sub: string; // userId
@@ -14,10 +15,11 @@ export interface SessionPayload {
 export async function createSessionToken(
   payload: { userId: string; email: string },
   secret: string,
-  expiresInSeconds = 60 * 60 * 8 // 8 hours
-): Promise<{ token: string; jti: string }> {
+  expiresInSeconds = SESSION_TTL_SECONDS
+): Promise<{ token: string; jti: string; expiresAt: Date }> {
   const jti = randomBytes(16).toString("hex");
   const secretKey = new TextEncoder().encode(secret);
+  const expiresAt = new Date(Date.now() + expiresInSeconds * 1000);
 
   const token = await new SignJWT({ email: payload.email })
     .setProtectedHeader({ alg: "HS256" })
@@ -26,10 +28,10 @@ export async function createSessionToken(
     .setIssuedAt()
     .setIssuer("flowforge:api")
     .setAudience("flowforge:client")
-    .setExpirationTime(`${expiresInSeconds}s`)
+    .setExpirationTime(Math.floor(expiresAt.getTime() / 1000))
     .sign(secretKey);
 
-  return { token, jti };
+  return { token, jti, expiresAt };
 }
 
 export async function verifySessionToken(

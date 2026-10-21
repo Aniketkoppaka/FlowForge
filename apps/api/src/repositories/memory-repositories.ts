@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import type { UserRepository, WorkflowRepository, UserRecord, WorkflowRecord } from "./types.js";
+import type {
+  UserRepository,
+  SessionRepository,
+  WorkflowRepository,
+  UserRecord,
+  SessionRecord,
+  WorkflowRecord
+} from "./types.js";
 
 export class InMemoryUserRepository implements UserRepository {
   private users = new Map<string, UserRecord>();
@@ -45,6 +52,59 @@ export class InMemoryUserRepository implements UserRepository {
     };
     this.users.set(record.id, record);
     return { ...record };
+  }
+}
+
+export class InMemorySessionRepository implements SessionRepository {
+  private sessionsByJti = new Map<string, SessionRecord>();
+
+  async create(data: {
+    jti: string;
+    userId: string;
+    expiresAt: Date;
+  }): Promise<SessionRecord> {
+    if (this.sessionsByJti.has(data.jti)) {
+      const err = new Error("Unique constraint failed on the fields: (`jti`)") as Error & {
+        code?: string;
+      };
+      err.code = "P2002";
+      throw err;
+    }
+
+    const record: SessionRecord = {
+      id: randomUUID(),
+      jti: data.jti,
+      userId: data.userId,
+      expiresAt: new Date(data.expiresAt.getTime()),
+      revokedAt: null,
+      createdAt: new Date()
+    };
+    this.sessionsByJti.set(data.jti, record);
+    return { ...record };
+  }
+
+  async findActiveByJti(jti: string, now: Date = new Date()): Promise<SessionRecord | null> {
+    const record = this.sessionsByJti.get(jti);
+    if (!record) {
+      return null;
+    }
+    if (record.revokedAt !== null) {
+      return null;
+    }
+    if (record.expiresAt.getTime() <= now.getTime()) {
+      return null;
+    }
+    return { ...record };
+  }
+
+  async revokeByJti(jti: string): Promise<boolean> {
+    const record = this.sessionsByJti.get(jti);
+    if (!record || record.revokedAt !== null) {
+      return false;
+    }
+    record.revokedAt = new Date();
+    this.sessionsByJti.set(jti, record);
+    return true;
   }
 }
 

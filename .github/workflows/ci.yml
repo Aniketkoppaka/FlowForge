@@ -29,6 +29,7 @@ jobs:
     env:
       DATABASE_URL: "postgresql://flowforge:flowforge_test_password@localhost:5432/flowforge_test?schema=public"
       NODE_ENV: "test"
+      RUN_DB_INTEGRATION_TESTS: "true"
       SESSION_SECRET: "ci-test-session-secret-minimum-32-chars-flowforge"
       CSRF_SECRET: "ci-test-csrf-secret-minimum-32-chars-flowforge-123"
 

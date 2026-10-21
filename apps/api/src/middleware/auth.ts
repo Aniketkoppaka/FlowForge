@@ -7,6 +7,7 @@ import {
   verifyCsrfToken,
   type SessionPayload
 } from "../security/session.js";
+import type { SessionRepository } from "../repositories/types.js";
 import type { AppConfig } from "../config.js";
 
 declare global {
@@ -20,7 +21,10 @@ declare global {
 
 const MUTATING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
-export function createAuthMiddleware(config: AppConfig) {
+export function createAuthMiddleware(
+  config: AppConfig,
+  sessionRepo: SessionRepository
+) {
   return async function requireAuth(req: Request, res: Response, next: NextFunction) {
     const token = req.cookies?.[SESSION_COOKIE_NAME] as string | undefined;
 
@@ -40,6 +44,28 @@ export function createAuthMiddleware(config: AppConfig) {
         error: {
           code: "UNAUTHORIZED",
           message: "Invalid or expired session"
+        }
+      });
+      return;
+    }
+
+    // Verify server-side session record is active and not revoked
+    try {
+      const persistedSession = await sessionRepo.findActiveByJti(session.jti);
+      if (!persistedSession || persistedSession.userId !== session.sub) {
+        res.status(401).json({
+          error: {
+            code: "UNAUTHORIZED",
+            message: "Session has been revoked or expired"
+          }
+        });
+        return;
+      }
+    } catch {
+      res.status(500).json({
+        error: {
+          code: "INTERNAL_ERROR",
+          message: "Failed to verify session state"
         }
       });
       return;

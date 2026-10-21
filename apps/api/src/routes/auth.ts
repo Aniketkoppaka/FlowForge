@@ -1,12 +1,13 @@
 import { Router, type Request, type Response } from "express";
 import rateLimit from "express-rate-limit";
 import { RegisterRequestSchema, LoginRequestSchema } from "@flowforge/contracts";
-import type { UserRepository, UserRecord } from "../repositories/types.js";
+import type { UserRepository, SessionRepository, UserRecord } from "../repositories/types.js";
 import type { AppConfig } from "../config.js";
 import { hashPassword, verifyPassword } from "../security/password.js";
 import {
   SESSION_COOKIE_NAME,
   CSRF_COOKIE_NAME,
+  SESSION_TTL_SECONDS,
   createSessionToken,
   generateCsrfToken
 } from "../security/session.js";
@@ -28,7 +29,7 @@ function setAuthCookies(
   csrfToken: string,
   isProd: boolean
 ) {
-  const maxAgeMs = 1000 * 60 * 60 * 8; // 8 hours
+  const maxAgeMs = SESSION_TTL_SECONDS * 1000;
 
   res.cookie(SESSION_COOKIE_NAME, sessionToken, {
     httpOnly: true,
@@ -62,10 +63,14 @@ function clearAuthCookies(res: Response, isProd: boolean) {
   });
 }
 
-export function createAuthRouter(userRepo: UserRepository, config: AppConfig): Router {
+export function createAuthRouter(
+  userRepo: UserRepository,
+  sessionRepo: SessionRepository,
+  config: AppConfig
+): Router {
   const router = Router();
   const isProd = config.NODE_ENV === "production";
-  const requireAuth = createAuthMiddleware(config);
+  const requireAuth = createAuthMiddleware(config, sessionRepo);
 
   const authRateLimiter = rateLimit({
     windowMs: 15 * 60 * 1000, // 15 minutes
@@ -115,12 +120,17 @@ export function createAuthRouter(userRepo: UserRepository, config: AppConfig): R
         passwordHash
       });
 
-      const { token, jti } = await createSessionToken(
+      const { token, jti, expiresAt } = await createSessionToken(
         { userId: user.id, email: user.email },
         config.SESSION_SECRET
       );
-      const csrfToken = generateCsrfToken(jti, config.CSRF_SECRET);
+      await sessionRepo.create({
+        jti,
+        userId: user.id,
+        expiresAt
+      });
 
+      const csrfToken = generateCsrfToken(jti, config.CSRF_SECRET);
       setAuthCookies(res, token, csrfToken, isProd);
 
       res.status(201).json({
@@ -186,12 +196,17 @@ export function createAuthRouter(userRepo: UserRepository, config: AppConfig): R
         return;
       }
 
-      const { token, jti } = await createSessionToken(
+      const { token, jti, expiresAt } = await createSessionToken(
         { userId: user.id, email: user.email },
         config.SESSION_SECRET
       );
-      const csrfToken = generateCsrfToken(jti, config.CSRF_SECRET);
+      await sessionRepo.create({
+        jti,
+        userId: user.id,
+        expiresAt
+      });
 
+      const csrfToken = generateCsrfToken(jti, config.CSRF_SECRET);
       setAuthCookies(res, token, csrfToken, isProd);
 
       res.status(200).json({
@@ -209,9 +224,19 @@ export function createAuthRouter(userRepo: UserRepository, config: AppConfig): R
   });
 
   // POST /api/auth/logout
-  router.post("/logout", requireAuth, (_req: Request, res: Response) => {
-    clearAuthCookies(res, isProd);
-    res.status(200).json({ ok: true });
+  router.post("/logout", requireAuth, async (req: Request, res: Response) => {
+    try {
+      await sessionRepo.revokeByJti(req.auth!.jti);
+      clearAuthCookies(res, isProd);
+      res.status(200).json({ ok: true });
+    } catch {
+      res.status(500).json({
+        error: {
+          code: "INTERNAL_ERROR",
+          message: "An unexpected error occurred during logout"
+        }
+      });
+    }
   });
 
   // GET /api/auth/me
@@ -221,6 +246,7 @@ export function createAuthRouter(userRepo: UserRepository, config: AppConfig): R
       const user = await userRepo.findById(userId);
 
       if (!user) {
+        await sessionRepo.revokeByJti(req.auth!.jti);
         clearAuthCookies(res, isProd);
         res.status(401).json({
           error: {

@@ -3,7 +3,18 @@ import { z } from "zod";
 const EnvSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   API_PORT: z.coerce.number().int().positive().default(4000),
-  CORS_ORIGIN: z.string().default("http://localhost:3000"),
+  CORS_ORIGIN: z
+    .string()
+    .min(1, "CORS_ORIGIN is required")
+    .refine(
+      (val) =>
+        val
+          .split(",")
+          .map((s) => s.trim())
+          .every((origin) => origin !== "*" && /^https?:\/\/[^\s/$.?#].[^\s]*$/i.test(origin)),
+      "CORS_ORIGIN must be a comma-separated list of explicit http(s) origins and cannot contain wildcard '*'"
+    )
+    .default("http://localhost:3000"),
   SESSION_SECRET: z
     .string()
     .min(32, "SESSION_SECRET must be at least 32 characters long"),

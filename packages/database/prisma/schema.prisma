@@ -15,8 +15,23 @@ model User {
   createdAt    DateTime   @default(now())
   updatedAt    DateTime   @updatedAt
   workflows    Workflow[]
+  sessions     Session[]
 
   @@index([email])
+}
+
+model Session {
+  id        String    @id @default(uuid()) @db.Uuid
+  jti       String    @unique @db.VarChar(64)
+  userId    String    @db.Uuid
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([jti, revokedAt, expiresAt])
 }
 
 model Workflow {
