@@ -10,6 +10,7 @@ import {
   validateGraphConnection,
   validateNodeConfigForEditor,
   validateWorkflowExecutionReadiness,
+  canonicalizeExecutableGraph,
   normalizeDraftDefinition,
   createDefaultEditorNode,
   removeNodeAndConnectedEdges,
@@ -418,6 +419,81 @@ describe("@flowforge/contracts", () => {
     it("rejects empty UpdateWorkflowRequest", () => {
       const result = UpdateWorkflowRequestSchema.safeParse({});
       expect(result.success).toBe(false);
+    });
+
+    it("produces identical canonicalizeExecutableGraph output regardless of node, edge, or object key ordering without mutating inputs", () => {
+      const graphA = {
+        schemaVersion: 1 as const,
+        nodes: [
+          {
+            id: "node_b",
+            type: "condition" as const,
+            label: "  Check Amount ",
+            position: { x: 300, y: 120 },
+            config: {
+              rightOperand: "100",
+              operator: "equals" as const,
+              leftOperand: "trigger.payload.amount"
+            }
+          },
+          {
+            id: "node_a",
+            type: "manual_trigger" as const,
+            label: "Trigger",
+            position: { x: 50, y: 120 },
+            config: { description: "Start" }
+          }
+        ],
+        edges: [
+          {
+            id: "edge_2",
+            source: "node_a",
+            sourceHandle: "default" as const,
+            target: "node_b",
+            targetHandle: "default" as const
+          }
+        ]
+      };
+
+      const graphB = {
+        schemaVersion: 1 as const,
+        nodes: [
+          {
+            id: "node_a",
+            type: "manual_trigger" as const,
+            label: "Trigger",
+            position: { x: 50, y: 120 },
+            config: { description: "Start" }
+          },
+          {
+            id: "node_b",
+            type: "condition" as const,
+            label: "Check Amount",
+            position: { x: 300, y: 120 },
+            config: {
+              leftOperand: "trigger.payload.amount",
+              operator: "equals" as const,
+              rightOperand: "100"
+            }
+          }
+        ],
+        edges: [
+          {
+            id: "edge_2",
+            source: "node_a",
+            sourceHandle: "default" as const,
+            target: "node_b",
+            targetHandle: "default" as const
+          }
+        ]
+      };
+
+      const snapA = JSON.stringify(graphA);
+      const canonicalA = canonicalizeExecutableGraph(graphA);
+      const canonicalB = canonicalizeExecutableGraph(graphB);
+
+      expect(canonicalA).toBe(canonicalB);
+      expect(JSON.stringify(graphA)).toBe(snapA); // Non-mutating
     });
   });
 });

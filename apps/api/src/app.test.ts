@@ -920,7 +920,7 @@ describe("@flowforge/api — Authentication, Session Revocation, Security & Work
       const runId = runRes.body.run.id;
 
       // 1. Outbox publication fails 5 times -> transitions to DEAD_LETTER
-      let currentClock = new Date("2026-10-21T18:00:00.000Z");
+      let currentClock = new Date(Date.now() + 1_000);
       const failingDispatcher = new OutboxDispatcher(
         executionRepo,
         {
@@ -950,7 +950,7 @@ describe("@flowforge/api — Authentication, Session Revocation, Security & Work
 
       // 2. Stale Worker Lease Fencing:
       // Worker 1 claims runId at T=0 with a 10s lease
-      const t0 = new Date("2026-10-21T19:00:00.000Z");
+      const t0 = new Date(currentClock.getTime() + 10_000);
       const claim1 = await executionRepo.claimRunForExecution({
         runId,
         workerId: "worker_stale_1",
@@ -1005,6 +1005,224 @@ describe("@flowforge/api — Authentication, Session Revocation, Security & Work
       expect(freshComplete).not.toBeNull();
       expect(freshComplete!.status).toBe("COMPLETED");
       expect(freshComplete!.attemptCount).toBe(2);
+    });
+
+    it("fault-injection: concurrent dispatchers, crash after outbox claim, crash after queue publish, maxAttempts exhaustion, and cancel-vs-complete race", async () => {
+      const userA = await registerAndGetAuth("faultinject@example.com");
+
+      const createRes = await request(app)
+        .post("/api/workflows")
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({
+          name: "Fault Injection Workflow",
+          draftDefinition: {
+            schemaVersion: 1,
+            nodes: [
+              { id: "trig", type: "manual_trigger", label: "Start", position: { x: 0, y: 0 }, config: { description: "" } },
+              {
+                id: "trans",
+                type: "data_transform",
+                label: "Transform",
+                position: { x: 200, y: 0 },
+                config: { mappings: [{ id: "m1", sourcePath: "trigger.payload.step", targetKey: "stepOut" }] }
+              }
+            ],
+            edges: [{ id: "e1", source: "trig", sourceHandle: "default", target: "trans", targetHandle: "default" }]
+          }
+        });
+      const wfId = createRes.body.workflow.id;
+
+      await request(app)
+        .post(`/api/workflows/${wfId}/publish`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken);
+
+      const runRes = await request(app)
+        .post(`/api/workflows/${wfId}/runs`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({ triggerPayload: { step: "fault-test" } });
+      const runId = runRes.body.run.id;
+
+      const t0 = new Date(Date.now() + 1_000);
+
+      // Scenario A: Two dispatchers attempting to claim work concurrently -> only one claims the event
+      const [claimDispA, claimDispB] = await Promise.all([
+        executionRepo.claimPendingOutboxEvents({
+          dispatcherId: "disp_A",
+          limit: 10,
+          leaseDurationMs: 10_000,
+          now: t0
+        }),
+        executionRepo.claimPendingOutboxEvents({
+          dispatcherId: "disp_B",
+          limit: 10,
+          leaseDurationMs: 10_000,
+          now: t0
+        })
+      ]);
+      expect(claimDispA.length + claimDispB.length).toBe(1);
+
+      // Scenario B: Crash after outbox claim (disp_A crashed without marking delivered or failed)
+      // After lease expires (t0 + 15s), disp_B recovers the abandoned PROCESSING event!
+      const tAfterLease = new Date(t0.getTime() + 15_000);
+      const recoveredByDispB = await executionRepo.claimPendingOutboxEvents({
+        dispatcherId: "disp_B",
+        limit: 10,
+        leaseDurationMs: 10_000,
+        now: tAfterLease
+      });
+      expect(recoveredByDispB).toHaveLength(1);
+      expect(recoveredByDispB[0]!.attempts).toBe(2);
+
+      // Scenario C: Crash after queue publication before marking DELIVERED
+      // disp_B publishes job `run:<runId>` to queue, then crashes before markOutboxEventDelivered.
+      // After disp_B's lease expires (t0 + 30s), disp_C re-claims, publishes `run:<runId>`, and marks DELIVERED.
+      const publishedJobs: QueueJobPayload[] = [];
+      publishedJobs.push({
+        jobId: `run:${runId}`,
+        runId,
+        workflowId: wfId,
+        workflowVersionId: runRes.body.run.workflowVersionId,
+        userId: userA.user.id
+      });
+
+      const tAfterSecondLease = new Date(t0.getTime() + 30_000);
+      const dispC = new OutboxDispatcher(
+        executionRepo,
+        {
+          enqueueRunJob: async (job) => {
+            publishedJobs.push(job);
+          }
+        },
+        {
+          dispatcherId: "disp_C",
+          now: () => tAfterSecondLease
+        }
+      );
+      const dispCBatch = await dispC.dispatchBatch();
+      expect(dispCBatch.delivered).toBe(1);
+      expect(publishedJobs).toHaveLength(2);
+      expect(publishedJobs[0]!.jobId).toBe(publishedJobs[1]!.jobId); // Deterministic jobId prevents duplicate queue entries
+
+      // Even if a duplicate job message reaches two workers sequentially or concurrently,
+      // the second worker is rejected by claimRunForExecution!
+      const processor1 = new WorkflowRunProcessor(executionRepo, {
+        workerId: "worker_1",
+        now: () => tAfterSecondLease
+      });
+      const processor2 = new WorkflowRunProcessor(executionRepo, {
+        workerId: "worker_2",
+        now: () => tAfterSecondLease
+      });
+      const firstExec = await processor1.processRun(runId);
+      expect(firstExec.processed).toBe(true);
+      expect(firstExec.status).toBe("COMPLETED");
+
+      const duplicateExec = await processor2.processRun(runId);
+      expect(duplicateExec.processed).toBe(false);
+      expect(duplicateExec.status).toBe("SKIPPED_CLAIM");
+
+      // Scenario D: Cancellation racing with completion
+      const run2Res = await request(app)
+        .post(`/api/workflows/${wfId}/runs`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({ triggerPayload: { step: "cancel-race" } });
+      const run2Id = run2Res.body.run.id;
+
+      // Worker claims run2 and begins executing
+      const claimRun2 = await executionRepo.claimRunForExecution({
+        runId: run2Id,
+        workerId: "worker_racing",
+        leaseDurationMs: 30_000,
+        now: t0
+      });
+      expect(claimRun2).not.toBeNull();
+
+      // User cancels run2 via POST /api/runs/:id/cancel while worker is still executing
+      const cancelRes = await request(app)
+        .post(`/api/runs/${run2Id}/cancel`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken);
+      expect(cancelRes.status).toBe(200);
+      expect(cancelRes.body.run.status).toBe("CANCELLED");
+
+      // Racing worker finishes node execution and attempts to commit COMPLETED -> fenced out!
+      const lateCommit = await executionRepo.completeRunExecution({
+        runId: run2Id,
+        workerId: "worker_racing",
+        attemptNumber: claimRun2!.attemptNumber,
+        status: "COMPLETED",
+        completedAt: new Date(t0.getTime() + 5_000),
+        durationMs: 5_000,
+        nodeResults: []
+      });
+      expect(lateCommit).toBeNull();
+
+      // Verify run2 remains CANCELLED and was not overwritten by COMPLETED
+      const checkRun2 = await request(app)
+        .get(`/api/runs/${run2Id}`)
+        .set("Cookie", userA.cookieHeader);
+      expect(checkRun2.body.run.status).toBe("CANCELLED");
+
+      // Scenario E: Worker crash repeated across maxAttempts (3) -> transitions to FAILED (MAX_ATTEMPTS_EXHAUSTED)
+      const run3Res = await request(app)
+        .post(`/api/workflows/${wfId}/runs`)
+        .set("Cookie", userA.cookieHeader)
+        .set(CSRF_HEADER_NAME, userA.csrfToken)
+        .send({ triggerPayload: { step: "exhaust-attempts" } });
+      const run3Id = run3Res.body.run.id;
+
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const claimed = await executionRepo.claimRunForExecution({
+          runId: run3Id,
+          workerId: `crash_worker_${attempt}`,
+          leaseDurationMs: 5_000,
+          now: new Date(t0.getTime() + attempt * 10_000)
+        });
+        expect(claimed).not.toBeNull();
+        expect(claimed!.attemptNumber).toBe(attempt);
+      }
+
+      // 4th attempt after 3rd lease expires -> returns null and marks run FAILED with MAX_ATTEMPTS_EXHAUSTED
+      const fourthClaim = await executionRepo.claimRunForExecution({
+        runId: run3Id,
+        workerId: "crash_worker_4",
+        leaseDurationMs: 5_000,
+        now: new Date(t0.getTime() + 50_000)
+      });
+      expect(fourthClaim).toBeNull();
+
+      const checkRun3 = await request(app)
+        .get(`/api/runs/${run3Id}`)
+        .set("Cookie", userA.cookieHeader);
+      expect(checkRun3.body.run.status).toBe("FAILED");
+      expect(checkRun3.body.run.error.code).toBe("MAX_ATTEMPTS_EXHAUSTED");
+
+      // Scenario F: Concurrent publish requests serialize cleanly without duplicate version numbers
+      const [pubConcurrentA, pubConcurrentB] = await Promise.all([
+        workflowRepo.publishVersion({
+          workflowId: wfId,
+          userId: userA.user.id,
+          contentHash: "concurrent-hash-v2",
+          definition: { schemaVersion: 1, nodes: [], edges: [] }
+        }),
+        workflowRepo.publishVersion({
+          workflowId: wfId,
+          userId: userA.user.id,
+          contentHash: "concurrent-hash-v3",
+          definition: { schemaVersion: 1, nodes: [], edges: [] }
+        })
+      ]);
+      expect(pubConcurrentA).not.toBeNull();
+      expect(pubConcurrentB).not.toBeNull();
+      const versionNumbers = [
+        pubConcurrentA!.version.versionNumber,
+        pubConcurrentB!.version.versionNumber
+      ].sort((a, b) => a - b);
+      expect(versionNumbers).toEqual([2, 3]);
     });
   });
 });

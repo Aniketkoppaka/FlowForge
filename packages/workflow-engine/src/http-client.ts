@@ -59,6 +59,12 @@ export interface SafeHttpRequestOptions {
    * Optional DNS resolver override for deterministic unit testing of DNS rebinding / mixed records.
    */
   resolveHostname?: (hostname: string) => Promise<Array<{ address: string; family: 4 | 6 }>>;
+  /**
+   * Internal test-only socket address override so local ephemeral HTTP test servers (listening on
+   * 127.0.0.1) can be used to test redirect blocking, response size caps, timeouts, and header
+   * redaction without weakening production SSRF IP validation.
+   */
+  __testConnectAddress?: { address: string; family: 4 | 6 };
 }
 
 export interface SafeHttpResponse {
@@ -427,7 +433,7 @@ export async function executeSafeHttpRequest(
     }
   }
 
-  const pinnedTarget = resolvedAddresses[0]!;
+  const pinnedTarget = options.__testConnectAddress ?? resolvedAddresses[0]!;
 
   // Custom lookup function pins socket connection to the exact validated IP (defeats DNS rebinding)
   const pinnedLookup: LookupFunction = (_hostname, lookupOpts, callback) => {

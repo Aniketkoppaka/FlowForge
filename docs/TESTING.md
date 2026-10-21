@@ -6,14 +6,14 @@ FlowForge uses **Vitest** across all packages and **React Testing Library / Supe
 
 | Suite | File | Executed Tests | Skipped Tests | Coverage Focus |
 | :--- | :--- | :---: | :---: | :--- |
-| `@flowforge/contracts` | `packages/contracts/src/contracts.test.ts` | **12** | 0 | Auth schemas, 4 node types, DAG connection rules, `DraftDefinitionSchema` vs. `validateWorkflowExecutionReadiness`, corrupted draft detection |
-| `@flowforge/workflow-engine` | `packages/workflow-engine/src/index.test.ts` | **14** | 0 | Safe path resolution, prototype pollution defense, condition operators, linear data flow, `true`/`false` branching + `SKIPPED` cascade, fail-closed HTTP, SSRF IP/URL/DNS rebinding regression suite |
-| `@flowforge/api` (In-Memory) | `apps/api/src/app.test.ts` | **17** | 0 | Registration, login, server-side session revocation, CSRF, CORS, rate limit, ownership isolation, graph validation, immutable version publishing, version pinning, idempotency keys, outbox dead-lettering, stale worker lease fencing |
+| `@flowforge/contracts` | `packages/contracts/src/contracts.test.ts` | **13** | 0 | Auth schemas, 4 node types, DAG connection rules, `DraftDefinitionSchema` vs. `validateWorkflowExecutionReadiness`, canonical graph hashing invariance, corrupted draft detection |
+| `@flowforge/workflow-engine` | `packages/workflow-engine/src/index.test.ts` | **15** | 0 | Safe path resolution, prototype pollution defense, condition operators, linear data flow, `true`/`false` branching + `SKIPPED` cascade, fail-closed HTTP, SSRF IP/URL/DNS rebinding + real local HTTP fixture tests (302 redirect block, response size limit, timeout, header redaction) |
+| `@flowforge/api` (In-Memory) | `apps/api/src/app.test.ts` | **18** | 0 | Registration, login, server-side session revocation, CSRF, CORS, rate limit, ownership isolation, graph validation, immutable version publishing, concurrent publish serialization, version pinning, idempotency keys, outbox fault-injection & dead-lettering, stale worker lease fencing, cancel-vs-complete race |
 | `@flowforge/api` (Live PostgreSQL) | `apps/api/src/prisma-integration.test.ts` | **0 locally** (**3 in CI**) | **3 locally** | Real PostgreSQL persistence, session revocation, `Restrict` FK verification, and end-to-end publish $\rightarrow$ outbox $\rightarrow$ worker $\rightarrow$ run persistence (`RUN_DB_INTEGRATION_TESTS="true"`) |
 | `@flowforge/web` | `apps/web/src/app/page.test.tsx` | **8** | 0 | Dashboard workflow creation, visual editor node addition/configuration/save/reload, save error recovery, Corrupted Draft Protection lock & repair, version publish + run execution inspector with `SKIPPED` branch |
 | `@flowforge/worker` | `apps/worker/src/index.test.ts` | **3** | 0 | Worker metadata, exponential backoff with jitter, `FlowForgeWorkerRuntime` lifecycle and concurrency bounds |
 | `@flowforge/database` | `packages/database/src/index.test.ts` | **1** | 0 | Prisma client initialization and export verification |
-| **Total** | **7 Test Files** | **55 Passed** | **3 Skipped Locally** | **0 Failed** |
+| **Total** | **7 Test Files** | **58 Passed** | **3 Skipped Locally** | **0 Failed** |
 
 ---
 

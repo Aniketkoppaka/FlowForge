@@ -1,3 +1,5 @@
+import http from "node:http";
+import type { AddressInfo } from "node:net";
 import { describe, it, expect } from "vitest";
 import {
   ENGINE_VERSION,
@@ -553,6 +555,116 @@ describe("@flowforge/workflow-engine — Milestone 3 Validation & Execution Suit
       expect(res.status).toBe("FAILED");
       expect(res.error?.code).toBe("SSRF_BLOCKED_IP");
       expect(res.error?.nodeId).toBe("http_ssrf");
+    });
+
+    it("enforces redirect blocking (302), response size caps (HTTP_RESPONSE_TOO_LARGE), timeouts (HTTP_TIMEOUT), and sensitive header redaction against a local HTTP fixture server", async () => {
+      const server = http.createServer((req, res) => {
+        if (req.url === "/redirect-to-internal") {
+          res.writeHead(302, { Location: "http://169.254.169.254/latest/meta-data/" });
+          res.end("Redirecting...");
+          return;
+        }
+        if (req.url === "/oversized") {
+          res.writeHead(200, { "Content-Type": "text/plain" });
+          res.end("X".repeat(8192));
+          return;
+        }
+        if (req.url === "/slow-timeout") {
+          setTimeout(() => {
+            if (!res.writableEnded) {
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ slow: true }));
+            }
+          }, 600);
+          return;
+        }
+        if (req.url === "/ok-with-sensitive-headers") {
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Set-Cookie": "session_secret=super-secret-cookie-value; HttpOnly",
+            "X-Custom-Header": "safe-value"
+          });
+          res.end(JSON.stringify({ receivedHost: req.headers.host, ok: true }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const port = (server.address() as AddressInfo).port;
+
+      try {
+        // 0. Verify direct request to http://127.0.0.1:<port> without test override is strictly blocked by SSRF!
+        await expect(
+          executeSafeHttpRequest({
+            method: "GET",
+            url: `http://127.0.0.1:${port}/ok-with-sensitive-headers`
+          })
+        ).rejects.toMatchObject({ code: "SSRF_BLOCKED_IP" });
+
+        const mockPublicResolver = async () => [{ address: "93.184.216.34", family: 4 as const }];
+        const localSocketOverride = { address: "127.0.0.1", family: 4 as const };
+
+        // 1. 302 redirect is blocked fail-closed (HTTP_REDIRECT_BLOCKED)
+        await expect(
+          executeSafeHttpRequest({
+            method: "GET",
+            url: `http://api.example.com:${port}/redirect-to-internal`,
+            resolveHostname: mockPublicResolver,
+            __testConnectAddress: localSocketOverride
+          })
+        ).rejects.toMatchObject({ code: "HTTP_REDIRECT_BLOCKED" });
+
+        // 2. Oversized response body is aborted immediately (HTTP_RESPONSE_TOO_LARGE)
+        await expect(
+          executeSafeHttpRequest({
+            method: "GET",
+            url: `http://api.example.com:${port}/oversized`,
+            maxResponseBytes: 2048,
+            resolveHostname: mockPublicResolver,
+            __testConnectAddress: localSocketOverride
+          })
+        ).rejects.toMatchObject({ code: "HTTP_RESPONSE_TOO_LARGE" });
+
+        // 3. Slow upstream response triggers timeout abort (HTTP_TIMEOUT)
+        await expect(
+          executeSafeHttpRequest({
+            method: "GET",
+            url: `http://api.example.com:${port}/slow-timeout`,
+            timeoutMs: 150,
+            resolveHostname: mockPublicResolver,
+            __testConnectAddress: localSocketOverride
+          })
+        ).rejects.toMatchObject({ code: "HTTP_TIMEOUT" });
+
+        // 4. Valid 200 JSON response preserves Host header and redacts Authorization, X-API-Key, and Set-Cookie
+        const okRes = await executeSafeHttpRequest({
+          method: "POST",
+          url: `http://api.example.com:${port}/ok-with-sensitive-headers`,
+          headers: [
+            { id: "h1", key: "Authorization", value: "Bearer top-secret-jwt" },
+            { id: "h2", key: "X-API-Key", value: "sk_live_secret_12345" },
+            { id: "h3", key: "X-Trace-Id", value: "trace-999" }
+          ],
+          body: JSON.stringify({ ping: true }),
+          resolveHostname: mockPublicResolver,
+          __testConnectAddress: localSocketOverride
+        });
+
+        expect(okRes.status).toBe(200);
+        expect(okRes.body).toEqual({
+          receivedHost: `api.example.com:${port}`,
+          ok: true
+        });
+        expect(okRes.redactedRequestHeaders["Authorization"]).toBe("[REDACTED]");
+        expect(okRes.redactedRequestHeaders["X-API-Key"]).toBe("[REDACTED]");
+        expect(okRes.redactedRequestHeaders["X-Trace-Id"]).toBe("trace-999");
+        expect(okRes.headers["set-cookie"]).toBe("[REDACTED]");
+        expect(okRes.headers["x-custom-header"]).toBe("safe-value");
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     });
   });
 });

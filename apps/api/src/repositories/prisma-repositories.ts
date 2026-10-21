@@ -173,60 +173,77 @@ export class PrismaWorkflowRepository implements WorkflowRepository {
     contentHash: string;
     definition: unknown;
   }): Promise<PublishVersionResult | null> {
-    return prisma.$transaction(async (tx) => {
-      const wf = await tx.workflow.findFirst({
-        where: {
-          id: data.workflowId,
-          userId: data.userId,
-          deletedAt: null
-        }
-      });
-      if (!wf) {
-        return null;
-      }
+    const maxRetries = 4;
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        return await prisma.$transaction(async (tx) => {
+          const wf = await tx.workflow.findFirst({
+            where: {
+              id: data.workflowId,
+              userId: data.userId,
+              deletedAt: null
+            }
+          });
+          if (!wf) {
+            return null;
+          }
 
-      if (wf.publishedVersionId) {
-        const currentPub = await tx.workflowVersion.findUnique({
-          where: { id: wf.publishedVersionId }
-        });
-        if (currentPub && currentPub.contentHash === data.contentHash) {
+          if (wf.publishedVersionId) {
+            const currentPub = await tx.workflowVersion.findUnique({
+              where: { id: wf.publishedVersionId }
+            });
+            if (currentPub && currentPub.contentHash === data.contentHash) {
+              return {
+                workflow: wf,
+                version: currentPub,
+                alreadyPublished: true
+              };
+            }
+          }
+
+          const latest = await tx.workflowVersion.findFirst({
+            where: { workflowId: data.workflowId },
+            orderBy: { versionNumber: "desc" }
+          });
+
+          const nextVersionNumber = (latest?.versionNumber ?? 0) + 1;
+          const version = await tx.workflowVersion.create({
+            data: {
+              workflowId: data.workflowId,
+              versionNumber: nextVersionNumber,
+              contentHash: data.contentHash,
+              definition: data.definition as Prisma.InputJsonValue
+            }
+          });
+
+          const updatedWorkflow = await tx.workflow.update({
+            where: { id: data.workflowId },
+            data: {
+              publishedVersionId: version.id,
+              publishedVersionNumber: nextVersionNumber
+            }
+          });
+
           return {
-            workflow: wf,
-            version: currentPub,
-            alreadyPublished: true
+            workflow: updatedWorkflow,
+            version,
+            alreadyPublished: false
           };
+        });
+      } catch (err) {
+        const isUniqueConflict =
+          typeof err === "object" &&
+          err !== null &&
+          "code" in err &&
+          (err as { code?: string }).code === "P2002";
+
+        if (isUniqueConflict && attempt < maxRetries) {
+          continue;
         }
+        throw err;
       }
-
-      const latest = await tx.workflowVersion.findFirst({
-        where: { workflowId: data.workflowId },
-        orderBy: { versionNumber: "desc" }
-      });
-
-      const nextVersionNumber = (latest?.versionNumber ?? 0) + 1;
-      const version = await tx.workflowVersion.create({
-        data: {
-          workflowId: data.workflowId,
-          versionNumber: nextVersionNumber,
-          contentHash: data.contentHash,
-          definition: data.definition as Prisma.InputJsonValue
-        }
-      });
-
-      const updatedWorkflow = await tx.workflow.update({
-        where: { id: data.workflowId },
-        data: {
-          publishedVersionId: version.id,
-          publishedVersionNumber: nextVersionNumber
-        }
-      });
-
-      return {
-        workflow: updatedWorkflow,
-        version,
-        alreadyPublished: false
-      };
-    });
+    }
+    return null;
   }
 
   async listVersionsByWorkflowIdAndUserId(

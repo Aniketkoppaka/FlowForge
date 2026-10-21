@@ -119,6 +119,7 @@ export class InMemorySessionRepository implements SessionRepository {
 export class InMemoryWorkflowRepository implements WorkflowRepository {
   private workflows = new Map<string, WorkflowRecord>();
   private versions = new Map<string, WorkflowVersionRecord>();
+  private publishLocks = new Map<string, Promise<unknown>>();
 
   async create(data: {
     userId: string;
@@ -211,56 +212,71 @@ export class InMemoryWorkflowRepository implements WorkflowRepository {
     contentHash: string;
     definition: unknown;
   }): Promise<PublishVersionResult | null> {
-    const wf = this.workflows.get(data.workflowId);
-    if (!wf || wf.userId !== data.userId || wf.deletedAt !== null) {
-      return null;
-    }
+    const previous = this.publishLocks.get(data.workflowId) ?? Promise.resolve();
+    let releaseLock!: () => void;
+    const currentLock = new Promise<void>((resolve) => {
+      releaseLock = resolve;
+    });
+    this.publishLocks.set(
+      data.workflowId,
+      previous.then(() => currentLock, () => currentLock)
+    );
 
-    // Policy: if the current published version already has the identical contentHash,
-    // return it idempotently (`alreadyPublished: true`) without creating a redundant version row.
-    if (wf.publishedVersionId) {
-      const currentPub = this.versions.get(wf.publishedVersionId);
-      if (currentPub && currentPub.contentHash === data.contentHash) {
-        return {
-          workflow: { ...wf },
-          version: structuredClone(currentPub),
-          alreadyPublished: true
-        };
+    await previous;
+    try {
+      const wf = this.workflows.get(data.workflowId);
+      if (!wf || wf.userId !== data.userId || wf.deletedAt !== null) {
+        return null;
       }
-    }
 
-    let maxVersion = 0;
-    for (const v of this.versions.values()) {
-      if (v.workflowId === data.workflowId && v.versionNumber > maxVersion) {
-        maxVersion = v.versionNumber;
+      // Policy: if the current published version already has the identical contentHash,
+      // return it idempotently (`alreadyPublished: true`) without creating a redundant version row.
+      if (wf.publishedVersionId) {
+        const currentPub = this.versions.get(wf.publishedVersionId);
+        if (currentPub && currentPub.contentHash === data.contentHash) {
+          return {
+            workflow: { ...wf },
+            version: structuredClone(currentPub),
+            alreadyPublished: true
+          };
+        }
       }
+
+      let maxVersion = 0;
+      for (const v of this.versions.values()) {
+        if (v.workflowId === data.workflowId && v.versionNumber > maxVersion) {
+          maxVersion = v.versionNumber;
+        }
+      }
+
+      const nextVersionNumber = maxVersion + 1;
+      const now = new Date();
+      const versionRecord: WorkflowVersionRecord = {
+        id: randomUUID(),
+        workflowId: data.workflowId,
+        versionNumber: nextVersionNumber,
+        contentHash: data.contentHash,
+        definition: structuredClone(data.definition),
+        createdAt: now
+      };
+      this.versions.set(versionRecord.id, versionRecord);
+
+      const updatedWf: WorkflowRecord = {
+        ...wf,
+        publishedVersionId: versionRecord.id,
+        publishedVersionNumber: nextVersionNumber,
+        updatedAt: now
+      };
+      this.workflows.set(updatedWf.id, updatedWf);
+
+      return {
+        workflow: { ...updatedWf },
+        version: structuredClone(versionRecord),
+        alreadyPublished: false
+      };
+    } finally {
+      releaseLock();
     }
-
-    const nextVersionNumber = maxVersion + 1;
-    const now = new Date();
-    const versionRecord: WorkflowVersionRecord = {
-      id: randomUUID(),
-      workflowId: data.workflowId,
-      versionNumber: nextVersionNumber,
-      contentHash: data.contentHash,
-      definition: structuredClone(data.definition),
-      createdAt: now
-    };
-    this.versions.set(versionRecord.id, versionRecord);
-
-    const updatedWf: WorkflowRecord = {
-      ...wf,
-      publishedVersionId: versionRecord.id,
-      publishedVersionNumber: nextVersionNumber,
-      updatedAt: now
-    };
-    this.workflows.set(updatedWf.id, updatedWf);
-
-    return {
-      workflow: { ...updatedWf },
-      version: structuredClone(versionRecord),
-      alreadyPublished: false
-    };
   }
 
   async listVersionsByWorkflowIdAndUserId(
