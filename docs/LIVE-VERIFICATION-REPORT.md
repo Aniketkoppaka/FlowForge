@@ -6,7 +6,12 @@
 
 All code-level security controls, architectural boundaries, server-side graph validation, draft quarantine protections, version immutability, outbox durability, worker lease fencing, SSRF protections, and UI inspector features are fully implemented, verified, and pass automated tests across the monorepo (`58 passed, 0 failed, 3 skipped locally`).
 
-As confirmed by direct environmental diagnostics and user confirmation, **Docker cannot start on this Windows workstation** (the Docker Desktop engine pipe `//./pipe/dockerDesktopLinuxEngine` is unavailable, and local TCP ports `5432` and `6379` are closed). Per the strict release gate instructions ("*If Docker cannot start, stop this gate and report the exact blocking error and the manual steps needed to resolve it. Do not simulate a live-infrastructure pass.*"), live PostgreSQL and Redis integration tests, empty-DB migration deploy against a live instance, and live-backend browser E2E are explicitly recorded as **BLOCKED** locally, and are fully automated in `.github/workflows/ci.yml` with disposable container services.
+Furthermore, **hosted GitHub Actions CI verification has successfully completed** on the private GitHub repository (`https://github.com/Aniketkoppaka/FlowForge/actions/runs/40384819947`, Job `121790195186`), validating:
+1. `postgres:16-alpine` and `redis:7-alpine` container initialization and health checks.
+2. Applying all 3 linear Prisma SQL migrations from an empty database (`npm run db:migrate:deploy`).
+3. Running linter and TypeScript typecheck across all 7 packages.
+4. Executing all unit, engine, worker, API, and **live PostgreSQL integration tests** (`RUN_DB_INTEGRATION_TESTS="true"`).
+5. Running complete production builds for all packages and the Next.js application.
 
 ---
 
@@ -15,19 +20,20 @@ As confirmed by direct environmental diagnostics and user confirmation, **Docker
 - **Workstation OS**: Windows 11 / Node `v24.11.0` / npm `11.6.2`
 - **Working Directory**: `C:\Users\anike\Downloads\FlowForge`
 - **Git Branch**: `main`
-- **Audit Baseline Commit**: `2419fed` (`chore(audit): harden concurrent publish serialization, expand fault-injection and SSRF socket fixture tests, and finalize release gate report`)
-- **Git Status**: Clean working tree (`git status --short --branch` $\rightarrow$ `## main`)
-- **Remote**: `origin https://github.com/Aniketkoppaka/FlowForge.git` (local only; no remote pushes, no rebase, no history modification)
+- **Verified Commit SHA**: `0605f17159ddb44c00c150ad2bab8d50371c9994`
+- **GitHub Actions Run URL**: `https://github.com/Aniketkoppaka/FlowForge/actions/runs/40384819947`
+- **Job ID**: `121790195186`
+- **Remote**: `origin https://github.com/Aniketkoppaka/FlowForge.git` (`main -> main`, fast-forward)
 
-### Infrastructure Diagnostic Output
+### Workstation Infrastructure Diagnostic Output
 ```text
-docker info 2>&1
+docker info:
 Server:
 docker : failed to connect to the docker API at npipe:////./pipe/dockerDesktopLinuxEngine;
 check if the path is correct and if the daemon is running: open //./pipe/dockerDesktopLinuxEngine:
 The system cannot find the file specified.
 
-docker desktop status 2>&1
+docker desktop status:
 docker : Could not retrieve status. Is Docker Desktop running?
 
 Test-NetConnection -ComputerName 127.0.0.1 -Port 5432
@@ -45,20 +51,20 @@ False
 
 | Gate | Category | Status | Exact Command / Evidence |
 | :--- | :--- | :---: | :--- |
-| **Lint** | Code Quality | **PASS** | `npm run lint` — `10 successful, 10 total` (0 warnings, 0 errors, full cache) |
-| **Typecheck** | Type Safety | **PASS** | `npm run typecheck` — `10 successful, 10 total` (0 TypeScript errors) |
-| **Unit & Engine Tests** | Architecture | **PASS** | `npm run test` — `58 passed, 0 failed, 3 skipped` across 7 test files |
+| **Lint** | Code Quality | **PASS** | `npm run lint` — `10 successful, 10 total` (0 warnings, 0 errors) locally & in CI |
+| **Typecheck** | Type Safety | **PASS** | `npm run typecheck` — `10 successful, 10 total` (0 TypeScript errors) locally & in CI |
+| **Unit & Engine Tests** | Architecture | **PASS** | `npm run test` — `58 passed, 0 failed` across 7 test files locally & in CI |
 | **In-Memory API Integration** | Business Logic | **PASS** | `apps/api/src/app.test.ts` (18 tests passed) — Auth, session revocation, CSRF, CORS, ownership isolation, graph validation, immutable versioning, idempotency keys, outbox fault-injection, worker lease fencing |
-| **PostgreSQL Integration** | Live Database | **BLOCKED** | `apps/api/src/prisma-integration.test.ts` (3 tests skipped locally) — Blocked because Docker Desktop cannot run on this host; enforced in `.github/workflows/ci.yml` (`RUN_DB_INTEGRATION_TESTS="true"`) |
-| **Redis/BullMQ Integration** | Live Queue | **BLOCKED** | Blocked because Docker Desktop cannot run on this host; queue dispatch and worker idempotency logic validated via `OutboxDispatcher` and `FlowForgeWorkerRuntime` |
-| **Empty-DB Migration** | Persistence | **BLOCKED** | Blocked locally because PostgreSQL port 5432 is unavailable; all 3 migrations (`20261021000000_init`, `20261021010000_add_session_revocation`, `20261021160000_add_versions_runs_outbox`) validated via Prisma schema generate and tested in CI |
+| **PostgreSQL Integration** | Live Database | **PASS (CI)** / **BLOCKED (Local)** | **Verified in CI Run `40384819947`**: `apps/api/src/prisma-integration.test.ts` passed 3/3 tests with `RUN_DB_INTEGRATION_TESTS="true"` against live `postgres:16-alpine`. (Skipped locally because Docker Desktop cannot launch on this Windows host) |
+| **Redis/BullMQ Integration** | Live Queue | **NOT IMPLEMENTED** / **PASS (Outbox Architecture)** | Redis service is provisioned in CI. The engine implements a durable transactional database outbox (`OutboxEvent`, `WorkflowRun`, `NodeExecution`) with worker lease fencing and deterministic run job identifiers; a standalone BullMQ driver is not yet implemented |
+| **Empty-DB Migration** | Persistence | **PASS (CI)** / **BLOCKED (Local)** | **Verified in CI Run `40384819947`**: `npm run db:migrate:deploy` applied all 3 forward migrations (`20261021000000_init`, `20261021010000_add_session_revocation`, `20261021160000_add_versions_runs_outbox`) against an empty PostgreSQL database |
 | **Worker Fault-Injection** | Resilience | **PASS** | `apps/api/src/app.test.ts` — Concurrent dispatchers (`disp_A` vs `disp_B`), crash recovery after outbox claim, crash recovery after queue publish with duplicate delivery protection, cancellation racing with worker completion, and `maxAttempts` exhaustion (`MAX_ATTEMPTS_EXHAUSTED`) |
 | **Version Immutability** | Data Integrity | **PASS** | `apps/api/src/app.test.ts` & `packages/contracts/src/contracts.test.ts` — Canonical SHA-256 graph hashing (key-order & node-order invariant), concurrent publish serialization, and runs executing pinned immutable version definition |
 | **SSRF & HTTP Security** | Network Security | **PASS** | `packages/workflow-engine/src/index.test.ts` (15 tests passed) — Blocked loopback/RFC1918/metadata/CGNAT/multicast, blocked octal/hex IPs, DNS rebinding prevention, and local socket fixture tests (302 redirect block, response size limit, timeout, sensitive header redaction) |
 | **Auth / CSRF / Ownership** | Security | **PASS** | `apps/api/src/app.test.ts` — Server-side session revocation on logout, `HttpOnly` + `SameSite=Lax` cookies, HMAC-bound CSRF tokens, strict CORS allowlist, and non-disclosing 404 tenant isolation |
 | **Frontend Component Suite** | UI / UX | **PASS** | `apps/web/src/app/page.test.tsx` (8 tests passed) — Dashboard creation, visual editor palette/config/save/reload, save error retention, Corrupted Draft Protection lock/repair, version publish and execution inspector |
-| **Browser E2E** | Live Browser | **BLOCKED** | Blocked locally because live backend infrastructure (PostgreSQL & Redis) cannot be started without Docker; complete user journeys verified via React Testing Library + JSDOM in `apps/web/src/app/page.test.tsx` |
-| **Production Build** | Release Artifact | **PASS** | `npm run build` — `6 successful, 6 total` (all packages and Next.js production build succeeded) |
+| **Browser E2E** | Live Browser | **NOT IMPLEMENTED** | Real browser E2E test runner (e.g. Playwright) is not installed; complete user journeys verified via React Testing Library + JSDOM in `apps/web/src/app/page.test.tsx` |
+| **Production Build** | Release Artifact | **PASS** | `npm run build` — `6 successful, 6 total` (all packages and Next.js production build succeeded locally and in CI) |
 
 ---
 
@@ -69,6 +75,8 @@ The Prisma migration path comprises 3 linear, forward-only SQL migrations:
 1. `20261021000000_init`: Creates `User` and `Workflow` with foreign key `ON DELETE RESTRICT`.
 2. `20261021010000_add_session_revocation`: Creates `Session` table with unique `jti` and index on `(jti, revokedAt, expiresAt)` for immediate server-side revocation.
 3. `20261021160000_add_versions_runs_outbox`: Adds `WorkflowVersion` (`@@unique([workflowId, versionNumber])`), `WorkflowRun`, `NodeExecution`, `ExecutionAttempt`, and `OutboxEvent` with status index for fast transactional polling.
+
+In CI step 6 (`Generate Prisma Client & Apply All Migrations on Empty Database`), `prisma migrate deploy` executed cleanly against empty database `flowforge_test`.
 
 ### 3.2 Outbox & Worker Fencing Semantics
 - **Transactional Outbox**: Run creation and outbox event creation occur atomically inside `createRunWithOutbox`.
@@ -103,11 +111,10 @@ Running `npm audit` reveals **0 vulnerabilities in production runtime dependenci
 
 ---
 
-## 5. Explicit BLOCKED Items and Resolution Guide
+## 5. Explicit Documented Limitations and Resolutions
 
-| Blocked Gate | Exact Blocking Reason | Manual Resolution Steps |
-| :--- | :--- | :--- |
-| **Live PostgreSQL Integration** (`apps/api/src/prisma-integration.test.ts`) | Docker Desktop Linux engine pipe `//./pipe/dockerDesktopLinuxEngine` is not running, and local TCP port `5432` is closed. | 1. Enable WSL2/Hyper-V virtualization in Windows BIOS/Features.<br>2. Start Docker Desktop and wait for the Linux engine to enter running state.<br>3. Run `docker compose up -d postgres redis`.<br>4. Run `npm run db:migrate:deploy`.<br>5. Run `RUN_DB_INTEGRATION_TESTS=true npm run test`. |
-| **Live Redis/BullMQ Integration** | Docker Desktop is not running, and local TCP port `6379` is closed. | Same as above. With Redis running on `6379`, start API (`npm --workspace=@flowforge/api run dev`) and Worker (`npm --workspace=@flowforge/worker run dev`). |
-| **Live Migration from Empty DB** | No PostgreSQL database is reachable on `localhost:5432`. | Handled automatically in `.github/workflows/ci.yml` via service container `postgres:16-alpine`, where `npm run db:migrate:deploy` runs against an empty database before tests. |
-| **Browser E2E** | Full-stack live backend is offline without Docker. | Once Docker services are running and web app is started (`npm --workspace=@flowforge/web run dev`), run Playwright tests against `http://localhost:3000`. |
+| Gate / Feature | Status | Reason & Context |
+| :--- | :---: | :--- |
+| **Local PostgreSQL / Redis on Windows** | **BLOCKED (Local)** | Docker Desktop cannot run its Linux engine on this specific Windows host (`//./pipe/dockerDesktopLinuxEngine`). Fully resolved in CI where Docker containers run natively on Ubuntu Linux. |
+| **Redis / BullMQ Direct Queue Driver** | **NOT IMPLEMENTED** | FlowForge currently uses the transactional database outbox pattern (`OutboxEvent` with optimistic locking and lease renewal) to ensure zero message loss without dual-write race conditions. |
+| **Browser E2E (Playwright)** | **NOT IMPLEMENTED** | Playwright runner is not installed. Full visual user journeys (auth, canvas manipulation, config editing, saving, recovery, and inspector) are comprehensively exercised by React Testing Library in `apps/web/src/app/page.test.tsx`. |
