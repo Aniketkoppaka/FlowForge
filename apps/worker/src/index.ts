@@ -6,6 +6,7 @@ import {
   createDefaultNodeHandlerRegistry,
   type HardenedHttpHandlerOptions
 } from "@flowforge/workflow-engine";
+import { createWorkerShutdownHandler } from "./shutdown.js";
 
 export const WORKER_QUEUE_NAME = "flowforge-workflow-runs" as const;
 
@@ -403,21 +404,14 @@ if (process.env.NODE_ENV !== "test") {
   const worker = new FlowForgeWorkerRuntime();
   worker.start();
 
-  const handleSignal = async (signal: string) => {
-    console.log(
-      JSON.stringify({
-        level: "info",
-        service: "@flowforge/worker",
-        event: "shutdown_signal_received",
-        signal,
-        timestamp: new Date().toISOString()
-      })
-    );
-    await worker.stop();
-    await prisma.$disconnect();
-    process.exit(0);
-  };
+  const shutdown = createWorkerShutdownHandler({
+    worker,
+    prismaClient: prisma,
+    deadlineMs: 15_000
+  });
 
-  process.on("SIGINT", () => void handleSignal("SIGINT"));
-  process.on("SIGTERM", () => void handleSignal("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
+
+export { createWorkerShutdownHandler };

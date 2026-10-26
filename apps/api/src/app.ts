@@ -20,6 +20,10 @@ export interface AppDependencies {
   workflowRepo: WorkflowRepository;
   executionRepo?: ExecutionRepository;
   onRunQueued?: (runId: string) => void;
+  runRateLimit?: {
+    windowMs?: number;
+    max?: number;
+  };
 }
 
 export function createApp({
@@ -28,7 +32,8 @@ export function createApp({
   sessionRepo,
   workflowRepo,
   executionRepo,
-  onRunQueued
+  onRunQueued,
+  runRateLimit
 }: AppDependencies): Express {
   const app = express();
 
@@ -96,7 +101,8 @@ export function createApp({
       sessionRepo,
       config,
       executionRepo,
-      onRunQueued
+      onRunQueued,
+      runRateLimit ? { runRateLimit } : undefined
     )
   );
   if (executionRepo) {

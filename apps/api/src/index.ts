@@ -1,3 +1,4 @@
+import { prisma } from "@flowforge/database";
 import { loadConfig } from "./config.js";
 import {
   PrismaUserRepository,
@@ -6,6 +7,7 @@ import {
   PrismaExecutionRepository
 } from "./repositories/prisma-repositories.js";
 import { createApp } from "./app.js";
+import { createApiShutdownHandler } from "./shutdown.js";
 
 const config = loadConfig();
 const userRepo = new PrismaUserRepository();
@@ -34,23 +36,15 @@ if (process.env.NODE_ENV !== "test") {
     );
   });
 
-  const shutdown = (signal: string) => {
-    console.log(
-      JSON.stringify({
-        level: "info",
-        service: "@flowforge/api",
-        event: "graceful_shutdown_started",
-        signal,
-        timestamp: new Date().toISOString()
-      })
-    );
-    server.close(() => {
-      process.exit(0);
-    });
-  };
+  const shutdown = createApiShutdownHandler({
+    server,
+    prismaClient: prisma,
+    deadlineMs: 10_000
+  });
 
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT"));
+  process.on("SIGTERM", () => void shutdown("SIGTERM"));
 }
 
-export { app };
+export { app, createApiShutdownHandler };
+

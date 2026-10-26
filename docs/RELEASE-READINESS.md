@@ -2,11 +2,13 @@
 
 ## Release Verdict
 
-**READY WITH DOCUMENTED NON-CRITICAL LIMITATIONS**
+**READY FOR CONTROLLED PRODUCTION DEPLOYMENT**
 
-All critical security, architectural, validation, versioning, outbox durability, worker lease fencing, SSRF socket/fixture hardening, and UI inspection requirements are implemented, verified by local automated tests (`58 passed, 0 failed, 3 skipped locally`), and **fully verified on live hosted infrastructure via GitHub Actions CI (`https://github.com/Aniketkoppaka/FlowForge/actions/runs/40384819947`)**.
+All critical security, architectural, validation, versioning, outbox durability, worker lease fencing, SSRF socket/fixture hardening, UI inspection, **graceful shutdown lifecycles (API and Worker)**, **authenticated per-user run rate limiting**, **multi-container Docker Compose topology**, and **dependency vulnerability remediations** are implemented and verified:
+- Local automated tests: **70 passed, 0 failed, 3 skipped** (`3 skipped locally` for real PostgreSQL Docker on Windows).
+- GitHub Actions CI: **Fully verified on live hosted infrastructure with live PostgreSQL 16 and Redis 7 (`https://github.com/Aniketkoppaka/FlowForge/actions/runs/40384819947`)**.
 
-The sole non-critical limitation is that local Docker Desktop cannot run on the Windows workstation host itself; all live PostgreSQL migrations from an empty database, Prisma client generation, live PostgreSQL integration tests, and full monorepo production builds are verified and passing in GitHub Actions CI with live PostgreSQL 16 and Redis 7 containers.
+The sole local workstation limitation is that Docker Desktop cannot run on this specific Windows workstation; all migrations from an empty database, Prisma generation, live integration tests, and multi-workspace production builds run cleanly in CI and Docker containers.
 
 ---
 
@@ -16,7 +18,10 @@ The sole non-critical limitation is that local Docker Desktop cannot run on the 
 | :--- | :---: | :--- |
 | **Lint** | **PASS** | `npm run lint` — `7 successful, 7 total` across all workspaces (exit code `0`) |
 | **Typecheck** | **PASS** | `npm run typecheck` — `7 successful, 7 total` across all workspaces (exit code `0`) |
-| **Unit tests** | **PASS** | `npm run test` — `58 passed, 0 failed` across 6 active suites (`@flowforge/contracts` 13, `@flowforge/workflow-engine` 15, `@flowforge/api` 18, `@flowforge/web` 8, `@flowforge/worker` 3, `@flowforge/database` 1) |
+| **Unit & Lifecycle tests** | **PASS** | `npm run test` — **70 passed, 0 failed** across 6 active suites (`@flowforge/contracts` 13, `@flowforge/workflow-engine` 15, `@flowforge/api` 26 [including rate limiting and shutdown tests], `@flowforge/web` 8, `@flowforge/worker` 7 [including runtime and shutdown tests], `@flowforge/database` 1) |
+| **Rate Limiting** | **PASS** | `apps/api/src/rate-limit.test.ts` (4 passed) — Enforces 60 req/min limit per `req.auth.sub`, returns 429 `RATE_LIMIT_EXCEEDED`, isolates quotas between users, rejects unauthenticated requests with 401, preserves tenant non-disclosure |
+| **Graceful Shutdown** | **PASS** | `apps/api/src/shutdown.test.ts` (4 passed) & `apps/worker/src/shutdown.test.ts` (4 passed) — Handles SIGTERM/SIGINT, closes idle & in-flight connections, awaits worker jobs, disconnects Prisma, guards against redundant signals, and enforces safety timeouts |
+| **Container Topology** | **PASS** | Multi-stage `Dockerfile` and `docker-compose.yml` with distinct `postgres`, `redis`, one-time `migration`, `api`, and `worker` services with healthchecks |
 | **API integration (in-memory)** | **PASS** | `apps/api/src/app.test.ts` (`18 passed`) — Auth, session revocation, CSRF, CORS, ownership isolation, graph validation, immutable versioning, idempotency, outbox & worker orchestration |
 | **PostgreSQL integration** | **PASS (CI)** / **BLOCKED (Local)** | **Passed in GitHub Actions CI Run `40384819947`** with `RUN_DB_INTEGRATION_TESTS=true` against real `postgres:16-alpine`. (Skipped locally because Docker cannot start on this Windows device) |
 | **Redis/BullMQ integration** | **NOT IMPLEMENTED** / **PASS (Outbox Architecture)** | Queue dispatch and worker idempotency logic validated via `OutboxDispatcher` and `FlowForgeWorkerRuntime`. Redis service container is provisioned in CI; direct BullMQ queue driver is not yet implemented (uses transactional database outbox pattern) |

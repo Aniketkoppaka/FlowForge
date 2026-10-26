@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Router, type Request, type Response } from "express";
+import rateLimit from "express-rate-limit";
 import { z } from "zod";
 import {
   CreateWorkflowRequestSchema,
@@ -95,17 +96,43 @@ export function serializeWorkflowRun(
   };
 }
 
+export interface WorkflowRouterOptions {
+  runRateLimit?: {
+    windowMs?: number;
+    max?: number;
+  };
+}
+
 export function createWorkflowRouter(
   workflowRepo: WorkflowRepository,
   sessionRepo: SessionRepository,
   config: AppConfig,
   executionRepo?: ExecutionRepository,
-  onRunQueued?: (runId: string) => void
+  onRunQueued?: (runId: string) => void,
+  options?: WorkflowRouterOptions
 ): Router {
   const router = Router();
   const requireAuth = createAuthMiddleware(config, sessionRepo);
 
   router.use(requireAuth);
+
+  const runLimiter = rateLimit({
+    windowMs: options?.runRateLimit?.windowMs ?? config.RUN_RATE_LIMIT_WINDOW_MS ?? 60_000,
+    limit: options?.runRateLimit?.max ?? config.RUN_RATE_LIMIT_MAX ?? 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req: Request) => {
+      return req.auth?.sub ?? req.ip ?? "anonymous";
+    },
+    handler: (_req: Request, res: Response) => {
+      res.status(429).json({
+        error: {
+          code: "RATE_LIMIT_EXCEEDED",
+          message: "Too many workflow run requests. Please try again later."
+        }
+      });
+    }
+  });
 
   // POST /api/workflows
   router.post("/", async (req: Request, res: Response) => {
@@ -431,7 +458,7 @@ export function createWorkflowRouter(
   });
 
   // POST /api/workflows/:id/runs — Enqueues an asynchronous execution run against a published version
-  router.post("/:id/runs", async (req: Request, res: Response) => {
+  router.post("/:id/runs", runLimiter, async (req: Request, res: Response) => {
     if (!executionRepo) {
       res.status(503).json({
         error: {

@@ -19,6 +19,8 @@ services:
       timeout: 5s
       retries: 10
       start_period: 5s
+    networks:
+      - flowforge-net
 
   redis:
     image: redis:7-alpine
@@ -35,7 +37,79 @@ services:
       timeout: 3s
       retries: 10
       start_period: 3s
+    networks:
+      - flowforge-net
+
+  migration:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: migration
+    container_name: flowforge-migration
+    restart: "no"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flowforge}:${POSTGRES_PASSWORD:-flowforge_dev_password}@postgres:5432/${POSTGRES_DB:-flowforge}?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - flowforge-net
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: api
+    container_name: flowforge-api
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      API_PORT: 4000
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flowforge}:${POSTGRES_PASSWORD:-flowforge_dev_password}@postgres:5432/${POSTGRES_DB:-flowforge}?schema=public
+      SESSION_SECRET: ${SESSION_SECRET:-dev-only-session-secret-minimum-32-chars-flowforge-local}
+      CSRF_SECRET: ${CSRF_SECRET:-dev-only-csrf-secret-minimum-32-chars-flowforge-local-key}
+      CORS_ORIGIN: ${CORS_ORIGIN:-http://localhost:3000}
+    ports:
+      - "${API_PORT:-4000}:4000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - flowforge-net
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: worker
+    container_name: flowforge-worker
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-flowforge}:${POSTGRES_PASSWORD:-flowforge_dev_password}@postgres:5432/${POSTGRES_DB:-flowforge}?schema=public
+      ENABLE_OUTBOUND_HTTP: ${ENABLE_OUTBOUND_HTTP:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migration:
+        condition: service_completed_successfully
+      api:
+        condition: service_started
+    networks:
+      - flowforge-net
 
 volumes:
   flowforge_pgdata:
   flowforge_redisdata:
+
+networks:
+  flowforge-net:
+    driver: bridge

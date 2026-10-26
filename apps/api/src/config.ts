@@ -20,7 +20,9 @@ const EnvSchema = z.object({
     .min(32, "SESSION_SECRET must be at least 32 characters long"),
   CSRF_SECRET: z
     .string()
-    .min(32, "CSRF_SECRET must be at least 32 characters long")
+    .min(32, "CSRF_SECRET must be at least 32 characters long"),
+  RUN_RATE_LIMIT_WINDOW_MS: z.coerce.number().int().positive().default(60000),
+  RUN_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(60)
 });
 
 export type AppConfig = z.infer<typeof EnvSchema>;
@@ -40,7 +42,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
     API_PORT: env.API_PORT,
     CORS_ORIGIN: env.CORS_ORIGIN,
     SESSION_SECRET: rawSessionSecret,
-    CSRF_SECRET: rawCsrfSecret
+    CSRF_SECRET: rawCsrfSecret,
+    RUN_RATE_LIMIT_WINDOW_MS: env.RUN_RATE_LIMIT_WINDOW_MS,
+    RUN_RATE_LIMIT_MAX: env.RUN_RATE_LIMIT_MAX
   });
 
   if (!parsed.success) {
