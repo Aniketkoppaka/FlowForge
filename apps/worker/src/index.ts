@@ -1,3 +1,4 @@
+import * as fs from "node:fs";
 import { randomUUID } from "node:crypto";
 import { prisma, Prisma } from "@flowforge/database";
 import {
@@ -17,6 +18,7 @@ export interface WorkerRuntimeConfig {
   concurrency: number;
   enableOutboundHttp: boolean;
   httpOptions?: HardenedHttpHandlerOptions;
+  heartbeatPath?: string;
 }
 
 export function getWorkerInfo() {
@@ -63,8 +65,19 @@ export class FlowForgeWorkerRuntime {
       enableOutboundHttp:
         config?.enableOutboundHttp ??
         process.env.ENABLE_OUTBOUND_HTTP === "true",
-      httpOptions: config?.httpOptions
+      httpOptions: config?.httpOptions,
+      heartbeatPath: config?.heartbeatPath ?? process.env.WORKER_HEARTBEAT_PATH
     };
+  }
+
+  private recordHeartbeat(): void {
+    if (this.config.heartbeatPath) {
+      try {
+        fs.writeFileSync(this.config.heartbeatPath, String(Date.now()), "utf8");
+      } catch {
+        // Non-fatal if filesystem is temporarily unavailable or read-only
+      }
+    }
   }
 
   getStatus() {
@@ -82,6 +95,7 @@ export class FlowForgeWorkerRuntime {
   start(): void {
     if (this.running) return;
     this.running = true;
+    this.recordHeartbeat();
     this.log("info", "worker_started", this.getStatus());
     this.scheduleNextTick();
   }
@@ -132,6 +146,8 @@ export class FlowForgeWorkerRuntime {
       orderBy: { createdAt: "asc" },
       take: availableSlots
     });
+
+    this.recordHeartbeat();
 
     let processedCount = 0;
 

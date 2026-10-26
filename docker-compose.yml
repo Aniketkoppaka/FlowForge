@@ -96,6 +96,7 @@ services:
       NODE_ENV: production
       DATABASE_URL: postgresql://${POSTGRES_USER:-flowforge}:${POSTGRES_PASSWORD:-flowforge_dev_password}@postgres:5432/${POSTGRES_DB:-flowforge}?schema=public
       ENABLE_OUTBOUND_HTTP: ${ENABLE_OUTBOUND_HTTP:-false}
+      WORKER_HEARTBEAT_PATH: /tmp/worker-heartbeat
     depends_on:
       postgres:
         condition: service_healthy
@@ -103,6 +104,12 @@ services:
         condition: service_completed_successfully
       api:
         condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "node -e 'const fs=require(\"fs\"); const diff=Date.now()-Number(fs.readFileSync(\"/tmp/worker-heartbeat\",\"utf8\")); if(isNaN(diff)||diff>30000) process.exit(1);'"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     networks:
       - flowforge-net
 

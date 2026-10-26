@@ -31,7 +31,7 @@ The sole local workstation limitation is that Docker Desktop cannot run on this 
 | **SSRF & HTTP security** | **PASS** | `packages/workflow-engine/src/index.test.ts` (`15 passed`) — Verifies fail-closed default (`NODE_NOT_SUPPORTED`) plus `executeSafeHttpRequest` against IPv4/IPv6 loopback, RFC1918, link-local/metadata (`169.254.169.254`, `100.100.100.200`, `fd00:ec2::254`), octal/hex/integer IPs, mixed DNS rebinding, and real local `http.createServer` socket fixtures (`302` redirect blocking, `HTTP_RESPONSE_TOO_LARGE`, `HTTP_TIMEOUT`, and `[REDACTED]` header sanitization) |
 | **Auth / CSRF / Ownership** | **PASS** | `apps/api/src/app.test.ts` — Verifies server-side session revocation on logout, `HttpOnly` + `SameSite=Lax` cookies, HMAC-bound CSRF enforcement on all state-changing routes, strict CORS allowlist, and non-disclosing `404` ownership isolation across workflows, versions, runs, nodes, and cancellation |
 | **Frontend tests** | **PASS** | `apps/web/src/app/page.test.tsx` (`8 passed`) — Verifies dashboard creation, visual editor node palette/configuration/save/reload, failed-save state retention, **Corrupted Draft Protection** save lock & explicit repair, and version publish $\rightarrow$ run execution inspector with `COMPLETED` and `SKIPPED` branches |
-| **Browser E2E** | **NOT IMPLEMENTED** | Real browser E2E test runner (e.g. Playwright) is not installed; comprehensive React Testing Library + JSDOM component and flow tests in `apps/web/src/app/page.test.tsx` verify the full dashboard, editor, configuration, publish, and inspector user journeys |
+| **Browser E2E** | **PASS** | Playwright Chromium suite (`e2e/workflow-lifecycle.spec.ts`) — **3 passed (8 journeys)** covering authentication, workflow creation, visual draft editing/persistence, version publication, execution triggering, node inspection, tenant 404 isolation, and accurate failure rendering |
 | **Production build** | **PASS** | `npm run build` — `6 successful, 6 total` across `@flowforge/contracts`, `@flowforge/database`, `@flowforge/workflow-engine`, `@flowforge/api`, `@flowforge/worker`, and `@flowforge/web` (exit code `0` locally and in CI) |
 
 ---
@@ -40,7 +40,7 @@ The sole local workstation limitation is that Docker Desktop cannot run on this 
 
 | Requirement | Status | Evidence |
 | :--- | :---: | :--- |
-| Cross-user access blocked on workflows, versions, runs, nodes, and cancel | **PASS** | `apps/api/src/routes/workflows.ts`, `apps/api/src/routes/runs.ts`, `apps/api/src/app.test.ts` |
+| Cross-user access blocked on workflows, versions, runs, nodes, and cancel | **PASS** | `apps/api/src/routes/workflows.ts`, `apps/api/src/routes/runs.ts`, `apps/api/src/app.test.ts`, `e2e/workflow-lifecycle.spec.ts` (Journey 7) |
 | Server-side session revocation invalidates JWT immediately on logout | **PASS** | `apps/api/src/security/session.ts`, `apps/api/src/app.test.ts`, `apps/api/src/prisma-integration.test.ts` (CI) |
 | Client cannot bypass server-side graph validation | **PASS** | `DraftDefinitionSchema` & `validateWorkflowExecutionReadiness` in `packages/contracts/src/workflow.ts` |
 | Malformed stored drafts are quarantined and locked against silent overwrite | **PASS** | `normalizeDraftDefinition` (`isCorrupted`) + **Corrupted Draft Protection** in `WorkflowEditor.tsx` & `page.test.tsx` |
@@ -48,10 +48,11 @@ The sole local workstation limitation is that Docker Desktop cannot run on this 
 | Concurrent publish calls serialize or retry cleanly without duplicate version numbers | **PASS** | `PrismaWorkflowRepository.publishVersion` (`P2002` retry) & `InMemoryWorkflowRepository.publishVersion` (`app.test.ts`) |
 | Transactional outbox + worker lease & `attemptNumber` fencing prevent stale workers from overwriting newer attempts or cancelled runs | **PASS** | `apps/api/src/services/execution-orchestrator.ts`, `apps/api/src/app.test.ts` |
 | Bounded retries and poison outbox dead-lettering (`DEAD_LETTER` after `maxAttempts`) | **PASS** | `apps/api/src/app.test.ts` (`handles outbox publication failures, crash recovery, poison dead-lettering...`) |
-| Outbound HTTP fails closed by default and blocks SSRF (loopback, RFC1918, metadata, octal/hex IPs, mixed DNS rebinding, redirects) when enabled | **PASS** | `packages/workflow-engine/src/http-client.ts`, `packages/workflow-engine/src/index.test.ts` |
+| Outbound HTTP fails closed by default and blocks SSRF (loopback, RFC1918, metadata, octal/hex IPs, mixed DNS rebinding, redirects) when enabled | **PASS** | `packages/workflow-engine/src/http-client.ts`, `packages/workflow-engine/src/index.test.ts`, `e2e/workflow-lifecycle.spec.ts` (Journey 8) |
 | Secrets and sensitive headers redacted from outputs and logs | **PASS** | `redactHeaders` in `packages/workflow-engine/src/http-client.ts` |
 | Forward SQL migrations coherent from an empty database | **PASS** | **Verified in CI Run `40384819947`**: `20261021000000_init`, `20261021010000_add_session_revocation`, `20261021160000_add_versions_runs_outbox` deployed successfully |
 | CI enforces `RUN_DB_INTEGRATION_TESTS="true"` against disposable PostgreSQL 16 & Redis 7 | **PASS** | **Verified in CI Run `40384819947`**: Job `121790195186` passed with all DB integration tests green |
+| Playwright browser E2E qualification covers core lifecycle journeys | **PASS** | `npm run test:e2e` passed (3 tests, 8 journeys) |
 
 ---
 
@@ -67,5 +68,3 @@ The sole local workstation limitation is that Docker Desktop cannot run on this 
    - All runtime application dependencies (`express`, `jose`, `zod`, `cookie-parser`, `cors`, `helmet`, `@prisma/client`) have zero known vulnerabilities.
 3. **Queue Architecture Note**:
    - The application implements a durable transactional outbox in PostgreSQL (`OutboxEvent`, `WorkflowRun`, `NodeExecution`) with worker lease fencing and deterministic run job identifiers. A dedicated external BullMQ queue driver is not yet added; the existing durable outbox polling architecture provides guaranteed at-least-once processing and optimistic concurrency fencing.
-4. **Browser E2E Testing**:
-   - Standalone Playwright browser E2E tests are marked **NOT IMPLEMENTED**. End-to-end user journeys are verified via React Testing Library + JSDOM in `apps/web/src/app/page.test.tsx`.

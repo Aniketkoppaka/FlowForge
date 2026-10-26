@@ -6,21 +6,57 @@ import {
   PrismaWorkflowRepository,
   PrismaExecutionRepository
 } from "./repositories/prisma-repositories.js";
+import {
+  InMemoryUserRepository,
+  InMemorySessionRepository,
+  InMemoryWorkflowRepository,
+  InMemoryExecutionRepository
+} from "./repositories/memory-repositories.js";
+import { WorkflowRunProcessor } from "./services/execution-orchestrator.js";
+import type {
+  UserRepository,
+  SessionRepository,
+  WorkflowRepository,
+  ExecutionRepository
+} from "./repositories/types.js";
 import { createApp } from "./app.js";
 import { createApiShutdownHandler } from "./shutdown.js";
 
 const config = loadConfig();
-const userRepo = new PrismaUserRepository();
-const sessionRepo = new PrismaSessionRepository();
-const workflowRepo = new PrismaWorkflowRepository();
-const executionRepo = new PrismaExecutionRepository();
+
+let userRepo: UserRepository;
+let sessionRepo: SessionRepository;
+let workflowRepo: WorkflowRepository;
+let executionRepo: ExecutionRepository;
+let onRunQueued: ((runId: string) => void) | undefined;
+
+if (process.env.API_REPOSITORY_DRIVER === "memory") {
+  userRepo = new InMemoryUserRepository();
+  sessionRepo = new InMemorySessionRepository();
+  const memWf = new InMemoryWorkflowRepository();
+  workflowRepo = memWf;
+  const memExec = new InMemoryExecutionRepository(memWf);
+  executionRepo = memExec;
+  const processor = new WorkflowRunProcessor(memExec, {
+    workerId: "in_memory_worker"
+  });
+  onRunQueued = (runId: string) => {
+    void processor.processRun(runId);
+  };
+} else {
+  userRepo = new PrismaUserRepository();
+  sessionRepo = new PrismaSessionRepository();
+  workflowRepo = new PrismaWorkflowRepository();
+  executionRepo = new PrismaExecutionRepository();
+}
 
 const app = createApp({
   config,
   userRepo,
   sessionRepo,
   workflowRepo,
-  executionRepo
+  executionRepo,
+  onRunQueued
 });
 
 if (process.env.NODE_ENV !== "test") {
@@ -38,7 +74,8 @@ if (process.env.NODE_ENV !== "test") {
 
   const shutdown = createApiShutdownHandler({
     server,
-    prismaClient: prisma,
+    prismaClient:
+      process.env.API_REPOSITORY_DRIVER === "memory" ? undefined : prisma,
     deadlineMs: 10_000
   });
 
